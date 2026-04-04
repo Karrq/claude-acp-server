@@ -3,3 +3,5 @@ dist
 .DS_Store
 .claude/*.local.*
 CLAUDE.local.md
+test-output
+scripts/*.local.sh

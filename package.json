@@ -1,14 +1,14 @@
 {
-  "name": "@agentclientprotocol/claude-agent-acp",
+  "name": "claude-acp-server",
   "publishConfig": {
     "access": "public"
   },
   "version": "0.25.0",
-  "description": "An ACP-compatible coding agent powered by the Claude Agent SDK (TypeScript)",
+  "description": "Anthropic-compatible HTTP facade over claude-agent-acp",
   "main": "dist/lib.js",
   "types": "dist/lib.d.ts",
   "bin": {
-    "claude-agent-acp": "dist/index.js"
+    "claude-acp-server": "dist/index.js"
   },
   "type": "module",
   "exports": {
@@ -34,8 +34,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "check": "npm run lint && npm run format:check",
-    "test": "vitest",
-    "test:integration": "RUN_INTEGRATION_TESTS=true vitest run",
+    "test": "vitest run",
     "test:run": "vitest run",
     "test:coverage": "vitest run --coverage",
     "prepublishOnly": "npm run build"
@@ -49,19 +48,18 @@
     "sdk",
     "code"
   ],
-  "homepage": "https://github.com/agentclientprotocol/claude-agent-acp#readme",
+  "homepage": "https://github.com/0xSero/claude-acp-server#readme",
   "bugs": {
-    "url": "https://github.com/agentclientprotocol/claude-agent-acp/issues"
+    "url": "https://github.com/0xSero/claude-acp-server/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/agentclientprotocol/claude-agent-acp.git"
+    "url": "git+https://github.com/0xSero/claude-acp-server.git"
   },
-  "author": "Zed Industries",
+  "author": "0xSero",
   "license": "Apache-2.0",
   "dependencies": {
     "@agentclientprotocol/sdk": "0.18.0",
-    "@anthropic-ai/claude-agent-sdk": "0.2.91",
     "zod": "^3.25.0 || ^4.0.0"
   },
   "devDependencies": {

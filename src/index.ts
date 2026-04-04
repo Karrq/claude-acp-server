@@ -1,31 +1,23 @@
 #!/usr/bin/env node
 
-// Load managed settings and apply environment variables
-import { loadManagedSettings, applyEnvironmentSettings } from "./utils.js";
-import { claudeCliPath, runAcp } from "./acp-agent.js";
+import { createFacadeServer, loadServerConfig } from "./lib.js";
 
-if (process.argv.includes("--cli")) {
-  process.argv = process.argv.filter((arg) => arg !== "--cli");
-  await import(await claudeCliPath());
-} else {
-  const managedSettings = loadManagedSettings();
-  if (managedSettings) {
-    applyEnvironmentSettings(managedSettings);
-  }
+const config = loadServerConfig();
+const server = createFacadeServer(config, console);
 
-  // stdout is used to send messages to the client
-  // we redirect everything else to stderr to make sure it doesn't interfere with ACP
-  console.log = console.error;
-  console.info = console.error;
-  console.warn = console.error;
-  console.debug = console.error;
+const running = await server.listen();
+console.log(
+  `[claude-acp-server] listening on http://${running.address.address}:${running.address.port}`,
+);
 
-  process.on("unhandledRejection", (reason, promise) => {
-    console.error("Unhandled Rejection at:", promise, "reason:", reason);
-  });
+const shutdown = async () => {
+  await server.close();
+  process.exit(0);
+};
 
-  runAcp();
-
-  // Keep process alive
-  process.stdin.resume();
-}
+process.on("SIGINT", () => {
+  void shutdown();
+});
+process.on("SIGTERM", () => {
+  void shutdown();
+});
