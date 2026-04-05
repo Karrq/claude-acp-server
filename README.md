@@ -76,14 +76,6 @@ For a streaming request:
 2. ACP `agent_message_chunk` notifications are translated into Anthropic `content_block_*` events.
 3. The final ACP prompt result is translated into `message_delta` and `message_stop`.
 
-## Compatibility Notes
-
-- The required Anthropic version is `2023-06-01` unless you change it in config.
-- Auth can be provided through `x-api-key` or `Authorization: Bearer ...`.
-- The response includes `x-acp-session-id` on successful message requests.
-- Model IDs are backend-dependent. The facade can also alias client-facing IDs to backend IDs where needed.
-- For streaming responses, `message_start.usage` is a provisional estimate (to avoid zero-token clients); the authoritative usage comes in the final `message_delta` event.
-
 Current built-in aliases:
 
 - `claude-sonnet-4-6` -> `sonnet`
