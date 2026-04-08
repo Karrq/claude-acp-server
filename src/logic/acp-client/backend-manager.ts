@@ -26,6 +26,7 @@ import {
   type WriteTextFileResponse,
 } from "@agentclientprotocol/sdk";
 import { spawn, type ChildProcessByStdio } from "node:child_process";
+import { appendFileSync } from "node:fs";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
@@ -34,6 +35,16 @@ import type { BackendRuntime, ServerConfig } from "../../types.js";
 import { nodeToWebReadable, nodeToWebWritable } from "../../helpers/streams.js";
 import { ACP_CLIENT_CAPABILITIES } from "../../configs.js";
 import { TerminalManager } from "./terminal-manager.js";
+
+// Debug logging to file
+const DEBUG_LOG = "/tmp/claude-acp-server-debug.log";
+function debugLog(msg: string): void {
+  try {
+    const timestamp = new Date().toISOString();
+    appendFileSync(DEBUG_LOG, `[${timestamp}] ${msg}\n`);
+  } catch {}
+}
+debugLog("backend-manager.ts loaded");
 
 type PromptListener = (notification: SessionNotification) => void | Promise<void>;
 
@@ -45,6 +56,7 @@ export class AcpBackendManager implements BackendManager, Client {
   private readonly sessionLocks = new Map<SessionId, Promise<void>>();
   private readonly terminalManager: TerminalManager;
   private modelsCache: NewSessionResponse["models"] | null = null;
+  private acpSessionId: SessionId | null = null;
 
   constructor(
     private readonly config: ServerConfig,
@@ -61,26 +73,59 @@ export class AcpBackendManager implements BackendManager, Client {
     const connection = await this.ensureConnection();
     const sessionCwd = cwd || this.config.sessionCwd;
 
-    if (!sessionId) {
-      const created = await connection.newSession({
-        cwd: sessionCwd,
-        mcpServers: [],
-      });
-      this.modelsCache = created.models ?? this.modelsCache;
-      return created;
+    // Parse CLAUDE_ACP_OPTIONS from env to pass as _meta.claudeCode.options
+    const claudeCodeOptions = process.env.CLAUDE_ACP_OPTIONS
+      ? JSON.parse(process.env.CLAUDE_ACP_OPTIONS)
+      : undefined;
+    // DEBUG: Log what we received
+    if (claudeCodeOptions) {
+      debugLog(`CLAUDE_ACP_OPTIONS received: ${JSON.stringify(claudeCodeOptions).slice(0, 500)}`);
+    } else {
+      debugLog("No CLAUDE_ACP_OPTIONS set");
+    }
+    // The ACP expects _meta.claudeCode.options, not _meta.claudeCode directly
+    // Also handle systemPrompt which should be at _meta level
+    const { systemPrompt, ...otherOptions } = claudeCodeOptions || {};
+    const _meta: any = claudeCodeOptions ? { claudeCode: { options: otherOptions } } : undefined;
+    if (systemPrompt) {
+      _meta.systemPrompt = systemPrompt;
+      debugLog(`Using custom systemPrompt: ${systemPrompt.slice(0, 100)}...`);
     }
 
-    const resumed = await connection.unstable_resumeSession({
-      sessionId,
+    // If we have a cached ACP session ID, try to resume it first
+    if (this.acpSessionId) {
+      debugLog(`Resuming cached session: ${this.acpSessionId}`);
+      try {
+        const resumed = await connection.unstable_resumeSession({
+          sessionId: this.acpSessionId,
+          cwd: sessionCwd,
+          mcpServers: [],
+          _meta,
+        });
+        debugLog(`Session resumed: ${resumed.sessionId}`);
+        return {
+          sessionId: resumed.sessionId,
+          modes: resumed.modes,
+          models: resumed.models,
+          configOptions: resumed.configOptions,
+        };
+      } catch (e) {
+        debugLog(`Resume failed (${e}), creating new session`);
+      }
+    }
+
+    // No cached session or resume failed — create a new one
+    debugLog("Creating NEW session");
+    debugLog(`_meta being sent: ${JSON.stringify(_meta).slice(0, 500)}`);
+    const created = await connection.newSession({
       cwd: sessionCwd,
       mcpServers: [],
+      _meta,
     });
-    return {
-      sessionId: resumed.sessionId,
-      modes: resumed.modes,
-      models: resumed.models,
-      configOptions: resumed.configOptions,
-    };
+    debugLog(`New session created: ${created.sessionId}`);
+    this.acpSessionId = created.sessionId;
+    this.modelsCache = created.models ?? this.modelsCache;
+    return created;
   }
 
   async setSessionMode(sessionId: SessionId, modeId: string): Promise<void> {

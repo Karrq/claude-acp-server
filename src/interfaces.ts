@@ -64,6 +64,7 @@ export interface PromptTranslator {
     sessionId: string;
     model: string;
     enableToolBridge: boolean;
+    includeProgressThinking?: boolean;
     initialUsage: ProvisionalStreamUsage;
     response: PromptResponse;
     notifications: SessionNotification[];

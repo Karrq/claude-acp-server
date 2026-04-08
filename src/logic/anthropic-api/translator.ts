@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { mkdirSync, writeFileSync, appendFileSync } from "node:fs";
+import { join } from "node:path";
 import type { PromptResponse, SessionNotification } from "@agentclientprotocol/sdk";
 import type {
   Message,
@@ -17,6 +19,13 @@ import {
   toAnthropicToolUseBlock,
 } from "../../helpers/messages.js";
 import type { FinalizedAnthropicTurn } from "../../types.js";
+
+function debug(msg: string): void {
+  try {
+    const ts = new Date().toISOString();
+    appendFileSync("/tmp/claude-acp-translator-debug.log", `[${ts}] ${msg}\n`);
+  } catch {}
+}
 
 function newMessageId(): string {
   return `msg_${randomUUID().replace(/-/g, "")}`;
@@ -49,6 +58,27 @@ class AnthropicStreamCollector {
   private pendingText = "";
   private pendingBridge = "";
   private readonly toolCallTitles = new Map<string, string>();
+  // Track ACP tool uses so we can emit proper tool_use/tool_result blocks
+  private readonly acpToolUses: Map<string, {
+    toolName: string;
+    rawInput: Record<string, unknown>;
+    rawOutput?: unknown;
+    status: string;
+    kind?: string;
+    title?: string;
+    content?: Array<{ type: string; [key: string]: unknown }>;
+    blockIndex: number;
+    inputEmitted: boolean; // whether we've already sent the full input_json_delta
+  }> = new Map();
+
+  // Write tool results to a cache directory so Pi extension can read them
+  private cacheToolResult(toolCallId: string, result: string, isError: boolean = false, details?: Record<string, unknown>): void {
+    try {
+      const dir = join("/tmp", "claude-acp-tool-results");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, `${toolCallId}.json`), JSON.stringify({ text: result, is_error: isError, details: details || {} }));
+    } catch {}
+  }
 
   constructor(
     private readonly requestId: string,
@@ -193,6 +223,18 @@ class AnthropicStreamCollector {
     this.activeThinkingBlockIndex = null;
   }
 
+  private closeTextBlock(emitted: RawMessageStreamEvent[]) {
+    if (this.activeTextBlockIndex === null) {
+      return;
+    }
+
+    emitted.push({
+      type: "content_block_stop",
+      index: this.activeTextBlockIndex,
+    });
+    this.activeTextBlockIndex = null;
+  }
+
   private summarizeToolPayload(value: unknown): string {
     if (value === undefined || value === null) {
       return "";
@@ -244,32 +286,218 @@ class AnthropicStreamCollector {
     return detail ? `\nUsing ${title}: ${detail}\n` : `\nUsing ${title}\n`;
   }
 
-  private formatToolCallUpdate(
+  private emitToolUseBlock(
+    update: Extract<SessionNotification["update"], { sessionUpdate: "tool_call" }>,
+    emitted: RawMessageStreamEvent[],
+  ) {
+    this.closeThinkingBlock(emitted);
+    this.closeTextBlock(emitted);
+
+    const toolCallId = update.toolCallId;
+    const toolName = (update as any)._meta?.claudeCode?.toolName || update.title || "Tool";
+    const rawInput: Record<string, unknown> = (update.rawInput as Record<string, unknown>) || {};
+
+    const hasInput = rawInput && Object.keys(rawInput).length > 0;
+    const blockIndex = this.content.length;
+
+    this.acpToolUses.set(toolCallId, {
+      toolName,
+      rawInput,
+      status: update.status || "pending",
+      kind: update.kind,
+      title: update.title,
+      blockIndex,
+      inputEmitted: hasInput, // if rawInput was non-empty, we emit it now
+    });
+
+    const inputJson = JSON.stringify(rawInput);
+
+    debug(`emitToolUseBlock: id=${toolCallId} name=${toolName} inputJson=${inputJson.slice(0, 200)} hasInput=${hasInput}`);
+
+    this.content.push({
+      type: "tool_use",
+      id: toolCallId,
+      name: toolName,
+      input: rawInput,
+      caller: { type: "direct" },
+    } as ToolUseBlock);
+
+    emitted.push({
+      type: "content_block_start",
+      index: blockIndex,
+      content_block: {
+        type: "tool_use",
+        id: toolCallId,
+        name: toolName,
+        input: {},
+        caller: { type: "direct" },
+      },
+    });
+
+    // Emit input_json_delta + content_block_stop if we have input now;
+    // otherwise defer to tool_call_update (which will emit input_json_delta + stop)
+    if (hasInput) {
+      emitted.push({
+        type: "content_block_delta",
+        index: blockIndex,
+        delta: {
+          type: "input_json_delta",
+          partial_json: inputJson,
+        },
+      });
+      emitted.push({
+        type: "content_block_stop",
+        index: blockIndex,
+      });
+    }
+    // If no input yet, content_block_stop is deferred — see cacheToolResultFromUpdate
+  }
+
+  private cacheToolResultFromUpdate(
     update: Extract<SessionNotification["update"], { sessionUpdate: "tool_call_update" }>,
-  ): string | null {
-    const title = update.title?.trim() || this.toolCallTitles.get(update.toolCallId) || "Tool";
-    if (update.title?.trim()) {
-      this.toolCallTitles.set(update.toolCallId, update.title.trim());
+  ): void {
+    const toolUse = this.acpToolUses.get(update.toolCallId);
+    const emitted: RawMessageStreamEvent[] = [];
+
+    if (toolUse) {
+      if (update.status) toolUse.status = update.status;
+      if (update.rawOutput !== undefined) toolUse.rawOutput = update.rawOutput;
+
+      // If the tool_call came with empty input but tool_call_update has rawInput,
+      // emit an input_json_delta + content_block_stop now so Pi gets the actual arguments
+      const updateRawInput = (update as any).rawInput as Record<string, unknown> | undefined;
+      if (updateRawInput && Object.keys(updateRawInput).length > 0 && !toolUse.inputEmitted) {
+        toolUse.rawInput = updateRawInput;
+        toolUse.inputEmitted = true;
+        const inputJson = JSON.stringify(updateRawInput);
+        debug(`cacheToolResultFromUpdate: emitting deferred input_json_delta for id=${update.toolCallId} inputJson=${inputJson.slice(0, 200)}`);
+        emitted.push({
+          type: "content_block_delta",
+          index: toolUse.blockIndex,
+          delta: {
+            type: "input_json_delta",
+            partial_json: inputJson,
+          },
+        });
+        // Now close the block
+        emitted.push({
+          type: "content_block_stop",
+          index: toolUse.blockIndex,
+        });
+        // Also update the content block in-place
+        const contentBlock = this.content[toolUse.blockIndex];
+        if (contentBlock && (contentBlock as any).type === "tool_use") {
+          (contentBlock as any).input = updateRawInput;
+        }
+        this.streamEvents.push(...emitted);
+      }
+
+      // Save diff content from intermediate updates for when completed fires
+      const updateContent = (update as any).content;
+      if (Array.isArray(updateContent)) {
+        for (const item of updateContent) {
+          if (item.type === "diff" && (item.oldText || item.newText)) {
+            if (!toolUse.content) toolUse.content = [];
+            // Avoid duplicates
+            if (!toolUse.content.some((c: any) => c.type === "diff" && c.path === item.path && c.oldText === item.oldText)) {
+              toolUse.content.push(item);
+            }
+          }
+        }
+      }
     }
 
     if (update.status === "completed") {
-      const outputSummary =
-        this.summarizeToolPayload(update.rawOutput) ||
-        this.summarizeToolLocations(update.locations);
-      return outputSummary ? `\nCompleted ${title}: ${outputSummary}\n` : `\nCompleted ${title}\n`;
+      const { output, details } = this.extractToolOutputWithDetails(update, toolUse);
+      this.cacheToolResult(update.toolCallId, output || "", false, details);
+    } else if (update.status === "failed") {
+      const output = this.extractToolOutput(update);
+      const errorText = output || "Tool execution failed (permission denied or cancelled)";
+      debug(`[translator] caching failed tool result: id=${update.toolCallId} error=${errorText.slice(0, 100)}`);
+      this.cacheToolResult(update.toolCallId, errorText, true);
+    }
+  }
+
+  private extractToolOutput(
+    update: Extract<SessionNotification["update"], { sessionUpdate: "tool_call_update" }>,
+  ): string {
+    // Try rawOutput first — but preserve newlines (don't use summarizeToolPayload which collapses whitespace)
+    if (update.rawOutput !== undefined && update.rawOutput !== null) {
+      if (typeof update.rawOutput === "string") {
+        const text = update.rawOutput.trim();
+        if (text.length) return text.slice(0, 2000);
+      } else {
+        try {
+          const serialized = JSON.stringify(update.rawOutput);
+          if (serialized !== "{}" && serialized !== "[]") {
+            return serialized.length > 2000 ? `${serialized.slice(0, 1997)}...` : serialized;
+          }
+        } catch {}
+      }
     }
 
-    if (update.status === "failed") {
-      const outputSummary = this.summarizeToolPayload(update.rawOutput);
-      return outputSummary ? `\nFailed ${title}: ${outputSummary}\n` : `\nFailed ${title}\n`;
+    // Try content array
+    if (Array.isArray((update as any).content)) {
+      for (const item of (update as any).content) {
+        if (item.type === "content" && item.content?.type === "text" && item.content.text) {
+          return item.content.text.slice(0, 2000);
+        }
+        if (item.type === "diff") {
+          return `diff: ${item.path || "unknown"}`;
+        }
+        if (item.type === "terminal") {
+          return "[terminal output]";
+        }
+      }
     }
 
-    if (update.status === "in_progress" && update.rawOutput !== undefined) {
-      const outputSummary = this.summarizeToolPayload(update.rawOutput);
-      return outputSummary ? `\n${title}: ${outputSummary}\n` : null;
+    // Try locations
+    const locs = this.summarizeToolLocations(update.locations);
+    if (locs) return locs;
+
+    return "";
+  }
+
+  private extractToolOutputWithDetails(
+    update: Extract<SessionNotification["update"], { sessionUpdate: "tool_call_update" }>,
+    toolUse?: { content?: Array<{ type: string; [key: string]: unknown }> },
+  ): { output: string; details: Record<string, unknown> } {
+    // Check for diff content from Edit/Write tools — prefer accumulated content from intermediate updates
+    const diffSource = toolUse?.content || (update as any).content;
+    const diffParts: string[] = [];
+    if (Array.isArray(diffSource)) {
+      for (const item of diffSource) {
+        if ((item as any).type === "diff" && ((item as any).oldText || (item as any).newText)) {
+          // Generate Pi-compatible diff format: +lineNum content / -lineNum content
+          const oldLines = ((item as any).oldText || "").split("\n");
+          const newLines = ((item as any).newText || "").split("\n");
+          const maxLineNum = Math.max(oldLines.length, newLines.length);
+          const lineNumWidth = String(maxLineNum).length;
+          const diffLines: string[] = [];
+          let oldLineNum = 1;
+          let newLineNum = 1;
+          for (const line of oldLines) {
+            const num = String(oldLineNum).padStart(lineNumWidth, " ");
+            diffLines.push(`-${num} ${line}`);
+            oldLineNum++;
+          }
+          for (const line of newLines) {
+            const num = String(newLineNum).padStart(lineNumWidth, " ");
+            diffLines.push(`+${num} ${line}`);
+            newLineNum++;
+          }
+          diffParts.push(diffLines.join("\n"));
+        }
+      }
     }
 
-    return null;
+    const details: Record<string, unknown> = {};
+    if (diffParts.length > 0) {
+      details.diff = diffParts.join("\n");
+    }
+
+    const output = this.extractToolOutput(update);
+    return { output, details };
   }
 
   private longestStartTokenSuffix(value: string): number {
@@ -359,16 +587,15 @@ class AnthropicStreamCollector {
     }
 
     if (update.sessionUpdate === "tool_call") {
-      this.emitThinkingDelta(this.formatToolCallStart(update), emitted);
+      debug(`[translator] tool_call: ${(update as any)._meta?.claudeCode?.toolName} id=${update.toolCallId}`);
+      this.emitToolUseBlock(update, emitted);
       this.streamEvents.push(...emitted);
       return emitted;
     }
 
     if (update.sessionUpdate === "tool_call_update") {
-      const updateText = this.formatToolCallUpdate(update);
-      if (updateText) {
-        this.emitThinkingDelta(updateText, emitted);
-      }
+      debug(`[translator] tool_call_update: id=${update.toolCallId} status=${update.status}`);
+      this.cacheToolResultFromUpdate(update);
       this.streamEvents.push(...emitted);
       return emitted;
     }
@@ -406,15 +633,29 @@ class AnthropicStreamCollector {
       this.streamEvents.push(...emitted);
     }
 
-    if (this.bridgedToolUse) {
-      this.closeThinkingBlock(this.streamEvents);
-      if (this.activeTextBlockIndex !== null) {
+    // Close any tool_use blocks that never received input via tool_call_update
+    for (const [toolCallId, toolUse] of this.acpToolUses) {
+      if (!toolUse.inputEmitted) {
+        debug(`finish: emitting late content_block_stop for tool_use id=${toolCallId} (no rawInput received)`);
+        this.streamEvents.push({
+          type: "content_block_delta",
+          index: toolUse.blockIndex,
+          delta: {
+            type: "input_json_delta",
+            partial_json: JSON.stringify(toolUse.rawInput),
+          },
+        });
         this.streamEvents.push({
           type: "content_block_stop",
-          index: this.activeTextBlockIndex,
+          index: toolUse.blockIndex,
         });
-        this.activeTextBlockIndex = null;
+        toolUse.inputEmitted = true;
       }
+    }
+
+    if (this.bridgedToolUse) {
+      this.closeThinkingBlock(this.streamEvents);
+      this.closeTextBlock(this.streamEvents);
 
       const block = toAnthropicToolUseBlock(this.bridgedToolUse, this.toolUseId) as ToolUseBlock;
       const blockIndex = this.content.length;
@@ -430,15 +671,19 @@ class AnthropicStreamCollector {
       });
     } else {
       this.closeThinkingBlock(this.streamEvents);
-      if (this.activeTextBlockIndex !== null) {
-        this.streamEvents.push({
-          type: "content_block_stop",
-          index: this.activeTextBlockIndex,
-        });
-        this.activeTextBlockIndex = null;
-      }
+      this.closeTextBlock(this.streamEvents);
     }
-    const stopReason = this.bridgedToolUse ? "tool_use" : mapStopReason(response.stopReason);
+    // If we have ACP tool_use blocks, set stop_reason to "tool_use"
+    // so Pi executes our registered tools and sends results back.
+    // The ACP backend will see the tool_result context in the next request
+    // and continue from where it left off.
+    const hasAcpToolUses = this.acpToolUses.size > 0;
+    const stopReason = this.bridgedToolUse
+      ? "tool_use"
+      : hasAcpToolUses
+        ? "tool_use"
+        : mapStopReason(response.stopReason);
+    debug(`[translator] finish: toolUses=${hasAcpToolUses ? this.acpToolUses.size : 0} stopReason=${stopReason} bridged=${!!this.bridgedToolUse}`);
     this.streamEvents.push({
       type: "message_delta",
       delta: {
@@ -510,6 +755,7 @@ export class AnthropicPromptTranslator implements PromptTranslator {
     sessionId: string;
     model: string;
     enableToolBridge: boolean;
+    includeProgressThinking?: boolean;
     initialUsage: ProvisionalStreamUsage;
     response: PromptResponse;
     notifications: SessionNotification[];
@@ -519,7 +765,7 @@ export class AnthropicPromptTranslator implements PromptTranslator {
       sessionId: args.sessionId,
       model: args.model,
       enableToolBridge: args.enableToolBridge,
-      includeProgressThinking: false,
+      includeProgressThinking: args.includeProgressThinking ?? false,
       initialUsage: args.initialUsage,
     });
     collector.start();

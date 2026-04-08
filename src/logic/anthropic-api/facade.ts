@@ -9,6 +9,7 @@ import type {
   MessageCreateParamsBase,
   RawMessageStreamEvent,
 } from "@anthropic-ai/sdk/resources/messages/messages";
+import type { PromptResponse } from "@agentclientprotocol/sdk";
 import { HttpError, requireAnthropicHeaders } from "../../helpers/errors.js";
 import {
   estimateProvisionalStreamUsage,
@@ -16,7 +17,28 @@ import {
   shouldEnableToolBridge,
 } from "../../helpers/messages.js";
 import type { FinalizedAnthropicTurn, ServerConfig } from "../../types.js";
-import type { SessionNotification } from "@agentclientprotocol/sdk";
+import { getTurnBuffer, hasTurnBuffer, clearTurnBuffer } from "./turn-buffer.js";
+import { appendFileSync } from "node:fs";
+
+const DEBUG_LOG = "/tmp/claude-acp-facade-debug.log";
+function debugLog(msg: string): void {
+  try {
+    const ts = new Date().toISOString();
+    appendFileSync(DEBUG_LOG, `[${ts}] ${msg}\n`);
+  } catch {}
+}
+
+// Detect if the request is a tool_result continuation
+// (last user message contains only tool_result blocks, no user text)
+function isToolResultContinuation(body: MessageCreateParamsBase): boolean {
+  const messages = body.messages;
+  if (!messages?.length) return false;
+  const lastMsg = messages[messages.length - 1];
+  if (lastMsg.role !== "user") return false;
+  const content = Array.isArray(lastMsg.content) ? lastMsg.content : [];
+  if (!content.length) return false;
+  return content.every((block: any) => block.type === "tool_result");
+}
 
 const MODEL_ALIASES: Record<string, string> = {
   "claude-sonnet-4-6": "sonnet",
@@ -50,14 +72,12 @@ export class AnthropicAcpFacade implements AnthropicFacade {
   ): Promise<FinalizedAnthropicTurn> {
     requireAnthropicHeaders(headers, this.config.anthropicVersion, this.config.apiKey);
 
-    const requestedSessionId = headers.get(this.config.sessionHeader) ?? undefined;
     const requestedCwd =
       headers.get(this.config.cwdHeader) ?? inferWorkingDirectoryFromRequest(body) ?? undefined;
-    const hasPriorSession = Boolean(requestedSessionId?.trim());
-    const ensured = await this.backend.ensureSession(requestedSessionId, requestedCwd);
+    const ensured = await this.backend.ensureSession(undefined, requestedCwd);
     const sessionId = ensured.sessionId;
 
-    if (!hasPriorSession && this.config.permissionMode && ensured.modes?.availableModes?.length) {
+    if (this.config.permissionMode && ensured.modes?.availableModes?.length) {
       const targetMode = ensured.modes.availableModes.find(
         (m) => m.id === this.config.permissionMode,
       );
@@ -67,21 +87,11 @@ export class AnthropicAcpFacade implements AnthropicFacade {
         } catch (err) {
           this.logger.warn("[claude-acp-server] failed to set permission mode", err);
         }
-      } else if (this.config.traceRequests) {
-        this.logger.log("[claude-acp-server] requested mode not available", {
-          requested: this.config.permissionMode,
-          available: ensured.modes.availableModes.map((m) => m.id),
-        });
       }
     }
 
     const requestedModel = body.model;
     const backendModel = MODEL_ALIASES[requestedModel] ?? requestedModel;
-    const enableToolBridge = shouldEnableToolBridge(body);
-    const initialUsage = estimateProvisionalStreamUsage({
-      request: body,
-      hasPriorSession,
-    });
 
     if (ensured.models?.availableModels?.length) {
       const knownModelIds = new Set(ensured.models.availableModels.map((entry) => entry.modelId));
@@ -96,69 +106,231 @@ export class AnthropicAcpFacade implements AnthropicFacade {
 
     await this.backend.setSessionModel(sessionId, backendModel);
 
-    const promptRequest = this.translator.toPromptRequest(sessionId, body);
-    const notifications: SessionNotification[] = [];
-    const requestId = randomUUID();
-    const collector = this.translator.createStreamCollector({
-      requestId,
-      sessionId,
-      model: requestedModel,
-      enableToolBridge,
-      includeProgressThinking: Boolean(streamObserver),
-      initialUsage,
-    });
-    let emittedStreamEventCount = 0;
+    // Detect continuation: last user message is tool_result only
+    const isContinuation = isToolResultContinuation(body);
+    debugLog(`handleMessages: isContinuation=${isContinuation} sessionId=${sessionId.slice(0, 8)}`);
 
-    if (streamObserver) {
-      await streamObserver.onReady({ sessionId, requestId });
-      await streamObserver.onEvent(collector.start());
-      emittedStreamEventCount += 1;
+    if (isContinuation && hasTurnBuffer(sessionId)) {
+      return this.handleContinuation(sessionId, requestedModel, streamObserver);
     }
 
+    // First request (or continuation with no buffer — shouldn't happen)
+    return this.handleInitialPrompt(sessionId, body, requestedModel, signal, streamObserver);
+  }
+
+  /**
+   * First request in a prompt cycle: run backend.prompt() to completion,
+   * buffer all notifications into the TurnBuffer, then return the first chunk.
+   */
+  private async handleInitialPrompt(
+    sessionId: string,
+    body: MessageCreateParamsBase,
+    model: string,
+    signal: AbortSignal | undefined,
+    streamObserver: {
+      onReady: (meta: { sessionId: string; requestId: string }) => void | Promise<void>;
+      onEvent: (event: RawMessageStreamEvent) => void | Promise<void>;
+    } | undefined,
+  ): Promise<FinalizedAnthropicTurn> {
+    // Clear any stale buffer from a previous prompt cycle
+    clearTurnBuffer(sessionId);
+    const buffer = getTurnBuffer(sessionId);
+
+    const enableToolBridge = shouldEnableToolBridge(body);
+    const initialUsage = estimateProvisionalStreamUsage({
+      request: body,
+      hasPriorSession: false,
+    });
+
+    const promptRequest = this.translator.toPromptRequest(sessionId, body);
+
+    debugLog(`handleInitialPrompt: starting backend.prompt()`);
+
+    // Run the backend prompt to completion, buffering all notifications
     const response = await this.backend.prompt({
       sessionId,
       request: promptRequest,
       signal,
-      onNotification: async (notification) => {
-        if (this.config.traceRequests) {
-          this.logger.log("[claude-acp-server] notification", {
-            type: notification.update.sessionUpdate,
-          });
-        }
-        notifications.push(notification);
-        if (streamObserver) {
-          const events = collector.pushNotification(notification);
-          if (this.config.traceRequests && events.length) {
-            this.logger.log("[claude-acp-server] emitting SSE events", {
-              count: events.length,
-              types: events.map((event) => event.type),
-            });
-          }
-          emittedStreamEventCount += events.length;
-          for (const event of events) {
-            await streamObserver.onEvent(event);
-          }
-        }
+      onNotification: (notification) => {
+        buffer.pushNotification(notification);
       },
     });
 
-    if (streamObserver) {
-      const finalized = collector.finish(response);
-      for (const event of finalized.streamEvents.slice(emittedStreamEventCount)) {
-        await streamObserver.onEvent(event);
-      }
-      return finalized;
+    buffer.finalize(response);
+    debugLog(`handleInitialPrompt: prompt complete, chunks=${buffer.chunkCount}`);
+
+    // Get the first chunk from the buffer
+    const firstChunk = await buffer.waitForNextChunk();
+    if (!firstChunk) {
+      throw new Error("No chunks produced from backend prompt");
     }
 
+    debugLog(`handleInitialPrompt: first chunk stopReason=${firstChunk.stopReason} notifications=${firstChunk.notifications.length}`);
+
+    // Translate the first chunk into an Anthropic turn
+    const turn = this.translateChunk(firstChunk, sessionId, model, initialUsage, response);
+
+    // Stream the SSE events if observer is present
+    if (streamObserver) {
+      await streamObserver.onReady({ sessionId, requestId: turn.requestId });
+      for (const event of turn.streamEvents) {
+        await streamObserver.onEvent(event);
+      }
+    }
+
+    // If this was the only chunk (no tool use), clean up the buffer
+    if (firstChunk.stopReason === "end_turn") {
+      clearTurnBuffer(sessionId);
+    }
+
+    return turn;
+  }
+
+  /**
+   * Continuation request: the backend already completed its prompt(),
+   * so we just serve the next chunk from the TurnBuffer.
+   * No duplicate context sent to the backend.
+   */
+  private async handleContinuation(
+    sessionId: string,
+    model: string,
+    streamObserver: {
+      onReady: (meta: { sessionId: string; requestId: string }) => void | Promise<void>;
+      onEvent: (event: RawMessageStreamEvent) => void | Promise<void>;
+    } | undefined,
+  ): Promise<FinalizedAnthropicTurn> {
+    const buffer = getTurnBuffer(sessionId);
+    const chunk = await buffer.waitForNextChunk();
+
+    if (!chunk) {
+      debugLog(`handleContinuation: no more chunks, returning empty end_turn`);
+      const emptyTurn = this.createEmptyTurn(sessionId, model);
+      if (streamObserver) {
+        await streamObserver.onReady({ sessionId, requestId: emptyTurn.requestId });
+        for (const event of emptyTurn.streamEvents) {
+          await streamObserver.onEvent(event);
+        }
+      }
+      clearTurnBuffer(sessionId);
+      return emptyTurn;
+    }
+
+    debugLog(`handleContinuation: chunk stopReason=${chunk.stopReason} notifications=${chunk.notifications.length} remaining=${buffer.chunkCount - buffer.consumedChunkCount}`);
+
+    const turn = this.translateChunk(chunk, sessionId, model, {
+      input_tokens: 0,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+    }, null);
+
+    if (streamObserver) {
+      await streamObserver.onReady({ sessionId, requestId: turn.requestId });
+      for (const event of turn.streamEvents) {
+        await streamObserver.onEvent(event);
+      }
+    }
+
+    // If this was the final chunk, clean up the buffer
+    if (chunk.stopReason === "end_turn") {
+      clearTurnBuffer(sessionId);
+    }
+
+    return turn;
+  }
+
+  /**
+   * Translate a TurnBuffer chunk into a FinalizedAnthropicTurn.
+   * Each chunk gets its own collector (via fromPromptResult),
+   * producing a complete Anthropic message with proper stop_reason.
+   */
+  private translateChunk(
+    chunk: {
+      notifications: import("@agentclientprotocol/sdk").SessionNotification[];
+      stopReason: string;
+      usage: PromptResponse["usage"] | null;
+    },
+    sessionId: string,
+    model: string,
+    initialUsage: { input_tokens: number; cache_creation_input_tokens: number | null; cache_read_input_tokens: number | null },
+    fullResponse: PromptResponse | null,
+  ): FinalizedAnthropicTurn {
+    // For the final chunk, use the real response (has real usage and stopReason)
+    // For intermediate chunks, use a synthetic response (stopReason gets overridden by translator)
+    const isLast = chunk.stopReason === "end_turn";
+    const response: PromptResponse = isLast && fullResponse
+      ? fullResponse
+      : {
+          stopReason: "end_turn" as const,
+          usage: chunk.usage ?? { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+        };
+
     return this.translator.fromPromptResult({
-      requestId,
+      requestId: randomUUID(),
       sessionId,
-      model: requestedModel,
-      enableToolBridge,
+      model,
+      enableToolBridge: false,
+      includeProgressThinking: true,
       initialUsage,
       response,
-      notifications,
+      notifications: chunk.notifications,
     });
+  }
+
+  /**
+   * Create an empty end_turn response for edge cases.
+   */
+  private createEmptyTurn(sessionId: string, model: string): FinalizedAnthropicTurn {
+    const messageId = `msg_${randomUUID().replace(/-/g, "")}`;
+    const requestId = randomUUID();
+    const message: any = {
+      id: messageId,
+      type: "message",
+      container: null,
+      role: "assistant",
+      content: [{ type: "text", text: "", citations: null }],
+      model,
+      stop_reason: "end_turn",
+      stop_sequence: null,
+      stop_details: null,
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation: null,
+        inference_geo: null,
+        server_tool_use: null,
+        service_tier: null,
+      },
+    };
+    const streamEvents: RawMessageStreamEvent[] = [
+      { type: "message_start", message },
+      {
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "text", text: "", citations: null },
+      },
+      { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "" } },
+      { type: "content_block_stop", index: 0 },
+      {
+        type: "message_delta",
+        delta: {
+          stop_reason: "end_turn",
+          stop_sequence: null,
+          stop_details: null,
+          container: null,
+        },
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0,
+          server_tool_use: null,
+        },
+      },
+      { type: "message_stop" },
+    ];
+    return { requestId, sessionId, streamEvents, message };
   }
 
   async listModels(headers: Headers) {

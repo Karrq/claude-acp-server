@@ -17,7 +17,8 @@ export function createFacadeServer(
 
   return {
     listen: async () => {
-      await backend.initialize();
+      // Don't block listen() on backend.initialize() — the backend (npx) can take
+      // 10+ seconds to start. Instead, initialize lazily on first request.
       return server.listen();
     },
     close: async () => {
