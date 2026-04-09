@@ -14,6 +14,7 @@ import {
   TOOL_USE_BRIDGE_END,
   TOOL_USE_BRIDGE_START,
   anthropicRequestToPromptRequest,
+  extractLastUserPrompt,
   type ProvisionalStreamUsage,
   parseBridgedToolUse,
   toAnthropicToolUseBlock,
@@ -730,6 +731,13 @@ export class AnthropicPromptTranslator implements PromptTranslator {
     request: Parameters<typeof anthropicRequestToPromptRequest>[1],
   ) {
     return anthropicRequestToPromptRequest(sessionId, request);
+  }
+
+  toIncrementalPromptRequest(
+    sessionId: string,
+    request: Parameters<typeof extractLastUserPrompt>[1],
+  ) {
+    return extractLastUserPrompt(sessionId, request);
   }
 
   createStreamCollector(args: {

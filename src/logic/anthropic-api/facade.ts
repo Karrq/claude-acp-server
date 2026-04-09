@@ -142,7 +142,7 @@ export class AnthropicAcpFacade implements AnthropicFacade {
       hasPriorSession: false,
     });
 
-    const promptRequest = this.translator.toPromptRequest(sessionId, body);
+    const promptRequest = this.translator.toIncrementalPromptRequest(sessionId, body);
 
     debugLog(`handleInitialPrompt: starting backend.prompt()`);
 

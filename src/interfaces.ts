@@ -47,6 +47,7 @@ export interface FacadeHttpServer {
 
 export interface PromptTranslator {
   toPromptRequest(sessionId: string, request: MessageCreateParamsBase): PromptRequest;
+  toIncrementalPromptRequest(sessionId: string, request: MessageCreateParamsBase): PromptRequest;
   createStreamCollector(args: {
     requestId: string;
     sessionId: string;

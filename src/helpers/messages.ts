@@ -412,3 +412,37 @@ export function anthropicRequestToPromptRequest(
     prompt,
   };
 }
+
+/**
+ * Extract only the last user message from a Messages API request and convert
+ * it to an ACP PromptRequest. Used for incremental prompting where the backend
+ * session already holds prior conversation state.
+ */
+export function extractLastUserPrompt(
+  sessionId: string,
+  request: MessageCreateParamsBase,
+): PromptRequest {
+  if (!request.messages.length) {
+    throw new HttpError({
+      status: 400,
+      type: "invalid_request_error",
+      message: "messages must contain at least one entry.",
+    });
+  }
+
+  const finalMessage = request.messages[request.messages.length - 1];
+  if (finalMessage.role !== "user") {
+    throw new HttpError({
+      status: 400,
+      type: "invalid_request_error",
+      message: "The final message must have role=user.",
+    });
+  }
+
+  const prompt: ContentBlock[] = [];
+  for (const block of normalizeMessageContent(finalMessage.content)) {
+    prompt.push(...contentBlockToAcp(block));
+  }
+
+  return { sessionId, prompt };
+}
