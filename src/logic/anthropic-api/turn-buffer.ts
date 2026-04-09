@@ -15,11 +15,15 @@ function debug(msg: string): void {
 // Splits them into chunks at tool batch boundaries.
 // Each chunk becomes one Anthropic API "turn" (response).
 
-interface TurnChunk {
+export interface TurnChunk {
   notifications: SessionNotification[];
   stopReason: "tool_use" | "end_turn";
   usage: PromptResponse["usage"] | null;
 }
+
+export type NotificationCallback = (notification: SessionNotification) => void;
+export type ChunkBoundaryCallback = (stopReason: "tool_use" | "end_turn") => void;
+export type FinalizeCallback = (response: PromptResponse) => void;
 
 export class TurnBuffer {
   private allNotifications: SessionNotification[] = [];
@@ -32,14 +36,37 @@ export class TurnBuffer {
   private chunkReadyResolvers: (() => void)[] = [];
   private nextChunkIndex = 0;
 
+  // Streaming callbacks - fire in real-time as notifications arrive
+  private notificationCallback: NotificationCallback | null = null;
+  private chunkBoundaryCallback: ChunkBoundaryCallback | null = null;
+  private finalizeCallback: FinalizeCallback | null = null;
+
   constructor() {
     this.promptPromise = new Promise<PromptResponse>((resolve) => {
       this.resolvePrompt = resolve;
     });
   }
 
+  /** Register callbacks for real-time streaming. Call before any notifications arrive. */
+  setStreamCallbacks(callbacks: {
+    onNotification: NotificationCallback;
+    onChunkBoundary: ChunkBoundaryCallback;
+    onFinalize: FinalizeCallback;
+  }): void {
+    this.notificationCallback = callbacks.onNotification;
+    this.chunkBoundaryCallback = callbacks.onChunkBoundary;
+    this.finalizeCallback = callbacks.onFinalize;
+  }
+
+  clearStreamCallbacks(): void {
+    this.notificationCallback = null;
+    this.chunkBoundaryCallback = null;
+    this.finalizeCallback = null;
+  }
+
   pushNotification(notification: SessionNotification): void {
     this.allNotifications.push(notification);
+    this.notificationCallback?.(notification);
     const update = notification.update;
 
     if (update.sessionUpdate === "tool_call") {
@@ -72,6 +99,7 @@ export class TurnBuffer {
       usage: null,
     });
     this.currentChunkNotifications = [];
+    this.chunkBoundaryCallback?.(stopReason);
     // Notify anyone waiting for a chunk
     for (const resolve of this.chunkReadyResolvers) {
       resolve();
@@ -89,6 +117,7 @@ export class TurnBuffer {
       this.chunks[this.chunks.length - 1].usage = response.usage ?? null;
     }
     debug(`finalize: total chunks=${this.chunks.length}`);
+    this.finalizeCallback?.(response);
     // Resolve the prompt promise
     if (this.resolvePrompt) {
       this.resolvePrompt(response);
@@ -134,6 +163,13 @@ export class TurnBuffer {
 
   get hasNextChunk(): boolean {
     return this.nextChunkIndex < this.chunks.length;
+  }
+
+  /** Advance the chunk index without returning the chunk. Used after streaming a chunk live. */
+  skipCurrentChunk(): void {
+    if (this.nextChunkIndex < this.chunks.length) {
+      this.nextChunkIndex++;
+    }
   }
 }
 

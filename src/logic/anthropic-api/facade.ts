@@ -17,7 +17,7 @@ import {
   shouldEnableToolBridge,
 } from "../../helpers/messages.js";
 import type { FinalizedAnthropicTurn, ServerConfig } from "../../types.js";
-import { getTurnBuffer, hasTurnBuffer, clearTurnBuffer } from "./turn-buffer.js";
+import { getTurnBuffer, hasTurnBuffer, clearTurnBuffer, type TurnChunk } from "./turn-buffer.js";
 import { appendFileSync } from "node:fs";
 
 const DEBUG_LOG = "/tmp/claude-acp-facade-debug.log";
@@ -119,8 +119,9 @@ export class AnthropicAcpFacade implements AnthropicFacade {
   }
 
   /**
-   * First request in a prompt cycle: run backend.prompt() to completion,
-   * buffer all notifications into the TurnBuffer, then return the first chunk.
+   * First request in a prompt cycle. If a streamObserver is provided,
+   * SSE events are forwarded in real-time as notifications arrive from the backend.
+   * Otherwise, the prompt runs to completion and the result is returned as a batch.
    */
   private async handleInitialPrompt(
     sessionId: string,
@@ -144,9 +145,13 @@ export class AnthropicAcpFacade implements AnthropicFacade {
 
     const promptRequest = this.translator.toIncrementalPromptRequest(sessionId, body);
 
-    debugLog(`handleInitialPrompt: starting backend.prompt()`);
+    debugLog(`handleInitialPrompt: starting backend.prompt() streaming=${!!streamObserver}`);
 
-    // Run the backend prompt to completion, buffering all notifications
+    if (streamObserver) {
+      return this.streamInitialPrompt(sessionId, body, model, signal, streamObserver, buffer, initialUsage, promptRequest);
+    }
+
+    // Non-streaming path: run to completion, batch translate
     const response = await this.backend.prompt({
       sessionId,
       request: promptRequest,
@@ -159,26 +164,13 @@ export class AnthropicAcpFacade implements AnthropicFacade {
     buffer.finalize(response);
     debugLog(`handleInitialPrompt: prompt complete, chunks=${buffer.chunkCount}`);
 
-    // Get the first chunk from the buffer
     const firstChunk = await buffer.waitForNextChunk();
     if (!firstChunk) {
       throw new Error("No chunks produced from backend prompt");
     }
 
-    debugLog(`handleInitialPrompt: first chunk stopReason=${firstChunk.stopReason} notifications=${firstChunk.notifications.length}`);
-
-    // Translate the first chunk into an Anthropic turn
     const turn = this.translateChunk(firstChunk, sessionId, model, initialUsage, response);
 
-    // Stream the SSE events if observer is present
-    if (streamObserver) {
-      await streamObserver.onReady({ sessionId, requestId: turn.requestId });
-      for (const event of turn.streamEvents) {
-        await streamObserver.onEvent(event);
-      }
-    }
-
-    // If this was the only chunk (no tool use), clean up the buffer
     if (firstChunk.stopReason === "end_turn") {
       clearTurnBuffer(sessionId);
     }
@@ -187,9 +179,128 @@ export class AnthropicAcpFacade implements AnthropicFacade {
   }
 
   /**
+   * Streaming path for the initial prompt. Starts the backend prompt in the background,
+   * streams SSE events to the client as notifications arrive, and resolves when the
+   * first chunk boundary is hit (tool_use) or the prompt completes (end_turn).
+   */
+  private async streamInitialPrompt(
+    sessionId: string,
+    body: MessageCreateParamsBase,
+    model: string,
+    signal: AbortSignal | undefined,
+    streamObserver: {
+      onReady: (meta: { sessionId: string; requestId: string }) => void | Promise<void>;
+      onEvent: (event: RawMessageStreamEvent) => void | Promise<void>;
+    },
+    buffer: ReturnType<typeof getTurnBuffer>,
+    initialUsage: { input_tokens: number; cache_creation_input_tokens: number | null; cache_read_input_tokens: number | null },
+    promptRequest: ReturnType<PromptTranslator["toIncrementalPromptRequest"]>,
+  ): Promise<FinalizedAnthropicTurn> {
+    const requestId = randomUUID();
+
+    const collector = this.translator.createStreamCollector({
+      requestId,
+      sessionId,
+      model,
+      enableToolBridge: shouldEnableToolBridge(body),
+      includeProgressThinking: true,
+      initialUsage,
+    });
+
+    // Emit message_start and open the SSE stream
+    await streamObserver.onReady({ sessionId, requestId });
+    await streamObserver.onEvent(collector.start());
+
+    // Track how many events we've sent so we can send only the finish events later
+    let eventsSent = 1; // message_start
+
+    // Promise that resolves when the first chunk boundary is reached or prompt finishes
+    let resolveChunkDone!: (result: { stopReason: "tool_use" | "end_turn"; response: PromptResponse | null }) => void;
+    let rejectChunkDone!: (err: unknown) => void;
+    const chunkDone = new Promise<{ stopReason: "tool_use" | "end_turn"; response: PromptResponse | null }>((resolve, reject) => {
+      resolveChunkDone = resolve;
+      rejectChunkDone = reject;
+    });
+
+    let chunkBoundaryHit = false;
+    let finalResponse: PromptResponse | null = null;
+
+    buffer.setStreamCallbacks({
+      onNotification: (notification) => {
+        if (chunkBoundaryHit) return;
+        const events = collector.pushNotification(notification);
+        for (const event of events) {
+          eventsSent++;
+          void streamObserver.onEvent(event);
+        }
+      },
+      onChunkBoundary: (stopReason) => {
+        if (chunkBoundaryHit) return;
+        chunkBoundaryHit = true;
+        debugLog(`streamInitialPrompt: chunk boundary stopReason=${stopReason}`);
+        resolveChunkDone({ stopReason, response: finalResponse });
+      },
+      onFinalize: (response) => {
+        finalResponse = response;
+        debugLog(`streamInitialPrompt: finalize received`);
+      },
+    });
+
+    // Start the backend prompt in the background
+    const promptPromise = this.backend.prompt({
+      sessionId,
+      request: promptRequest,
+      signal,
+      onNotification: (notification) => {
+        buffer.pushNotification(notification);
+      },
+    });
+
+    // Finalize the buffer when the prompt completes or propagate errors
+    promptPromise.then(
+      (response) => {
+        buffer.finalize(response);
+      },
+      (err) => {
+        debugLog(`streamInitialPrompt: prompt error: ${err}`);
+        buffer.clearStreamCallbacks();
+        if (!chunkBoundaryHit) {
+          rejectChunkDone(err);
+        }
+      },
+    );
+
+    // Wait for the first chunk boundary or prompt completion
+    const { stopReason, response } = await chunkDone;
+    buffer.clearStreamCallbacks();
+    // Mark this chunk as consumed so continuations don't replay it
+    buffer.skipCurrentChunk();
+
+    // Finalize the collector. For tool_use chunks we need stop_reason=tool_use
+    // but the collector's finish() derives stop_reason from tool_use blocks it has seen.
+    const finishResponse: PromptResponse = response ?? {
+      stopReason: "end_turn" as const,
+      usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+    };
+    const turn = collector.finish(finishResponse);
+
+    // Send only the events added by finish() (closing blocks, message_delta, message_stop)
+    const allEvents = turn.streamEvents;
+    for (let i = eventsSent; i < allEvents.length; i++) {
+      await streamObserver.onEvent(allEvents[i]);
+    }
+
+    if (stopReason === "end_turn") {
+      clearTurnBuffer(sessionId);
+    }
+
+    return turn;
+  }
+
+  /**
    * Continuation request: the backend already completed its prompt(),
-   * so we just serve the next chunk from the TurnBuffer.
-   * No duplicate context sent to the backend.
+   * so we serve the next chunk from the TurnBuffer.
+   * If streaming, events are sent incrementally through the collector.
    */
   private async handleContinuation(
     sessionId: string,
@@ -200,10 +311,26 @@ export class AnthropicAcpFacade implements AnthropicFacade {
     } | undefined,
   ): Promise<FinalizedAnthropicTurn> {
     const buffer = getTurnBuffer(sessionId);
+
+    // If the next chunk is already buffered, we can check immediately
+    if (!buffer.hasNextChunk && buffer.isComplete) {
+      debugLog(`handleContinuation: no more chunks, returning empty end_turn`);
+      const emptyTurn = this.createEmptyTurn(sessionId, model);
+      if (streamObserver) {
+        await streamObserver.onReady({ sessionId, requestId: emptyTurn.requestId });
+        for (const event of emptyTurn.streamEvents) {
+          await streamObserver.onEvent(event);
+        }
+      }
+      clearTurnBuffer(sessionId);
+      return emptyTurn;
+    }
+
+    // Wait for the next chunk (may already be buffered, or still in-flight)
     const chunk = await buffer.waitForNextChunk();
 
     if (!chunk) {
-      debugLog(`handleContinuation: no more chunks, returning empty end_turn`);
+      debugLog(`handleContinuation: waitForNextChunk returned null`);
       const emptyTurn = this.createEmptyTurn(sessionId, model);
       if (streamObserver) {
         await streamObserver.onReady({ sessionId, requestId: emptyTurn.requestId });
@@ -217,20 +344,78 @@ export class AnthropicAcpFacade implements AnthropicFacade {
 
     debugLog(`handleContinuation: chunk stopReason=${chunk.stopReason} notifications=${chunk.notifications.length} remaining=${buffer.chunkCount - buffer.consumedChunkCount}`);
 
+    // Stream the chunk's notifications through a collector for incremental SSE delivery
+    if (streamObserver) {
+      return this.streamChunk(chunk, sessionId, model, streamObserver);
+    }
+
+    // Non-streaming: batch translate as before
     const turn = this.translateChunk(chunk, sessionId, model, {
       input_tokens: 0,
       cache_creation_input_tokens: 0,
       cache_read_input_tokens: 0,
     }, null);
 
-    if (streamObserver) {
-      await streamObserver.onReady({ sessionId, requestId: turn.requestId });
-      for (const event of turn.streamEvents) {
+    if (chunk.stopReason === "end_turn") {
+      clearTurnBuffer(sessionId);
+    }
+
+    return turn;
+  }
+
+  /**
+   * Stream an already-buffered chunk's notifications through a collector,
+   * sending SSE events incrementally to the client.
+   */
+  private async streamChunk(
+    chunk: TurnChunk,
+    sessionId: string,
+    model: string,
+    streamObserver: {
+      onReady: (meta: { sessionId: string; requestId: string }) => void | Promise<void>;
+      onEvent: (event: RawMessageStreamEvent) => void | Promise<void>;
+    },
+  ): Promise<FinalizedAnthropicTurn> {
+    const requestId = randomUUID();
+    const collector = this.translator.createStreamCollector({
+      requestId,
+      sessionId,
+      model,
+      enableToolBridge: false,
+      includeProgressThinking: true,
+      initialUsage: {
+        input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+      },
+    });
+
+    await streamObserver.onReady({ sessionId, requestId });
+    await streamObserver.onEvent(collector.start());
+    let eventsSent = 1;
+
+    // Replay buffered notifications through the collector, streaming each event
+    for (const notification of chunk.notifications) {
+      const events = collector.pushNotification(notification);
+      for (const event of events) {
+        eventsSent++;
         await streamObserver.onEvent(event);
       }
     }
 
-    // If this was the final chunk, clean up the buffer
+    // Finalize to get closing events
+    const response: PromptResponse = {
+      stopReason: "end_turn" as const,
+      usage: chunk.usage ?? { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+    };
+    const turn = collector.finish(response);
+
+    // Send only the finish events
+    const allEvents = turn.streamEvents;
+    for (let i = eventsSent; i < allEvents.length; i++) {
+      await streamObserver.onEvent(allEvents[i]);
+    }
+
     if (chunk.stopReason === "end_turn") {
       clearTurnBuffer(sessionId);
     }

@@ -356,7 +356,7 @@ class AnthropicStreamCollector {
 
   private cacheToolResultFromUpdate(
     update: Extract<SessionNotification["update"], { sessionUpdate: "tool_call_update" }>,
-  ): void {
+  ): RawMessageStreamEvent[] {
     const toolUse = this.acpToolUses.get(update.toolCallId);
     const emitted: RawMessageStreamEvent[] = [];
 
@@ -417,6 +417,8 @@ class AnthropicStreamCollector {
       debug(`[translator] caching failed tool result: id=${update.toolCallId} error=${errorText.slice(0, 100)}`);
       this.cacheToolResult(update.toolCallId, errorText, true);
     }
+
+    return emitted;
   }
 
   private extractToolOutput(
@@ -596,9 +598,10 @@ class AnthropicStreamCollector {
 
     if (update.sessionUpdate === "tool_call_update") {
       debug(`[translator] tool_call_update: id=${update.toolCallId} status=${update.status}`);
-      this.cacheToolResultFromUpdate(update);
-      this.streamEvents.push(...emitted);
-      return emitted;
+      const toolUpdateEvents = this.cacheToolResultFromUpdate(update);
+      // cacheToolResultFromUpdate already pushed to streamEvents internally,
+      // so just return the events without double-pushing
+      return toolUpdateEvents;
     }
 
     if (update.sessionUpdate !== "agent_message_chunk") {
