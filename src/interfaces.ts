@@ -20,6 +20,7 @@ export interface Logger {
 export interface BackendManager {
   initialize(): Promise<void>;
   ensureSession(sessionId: string | undefined, cwd?: string): Promise<NewSessionResponse>;
+  resetSession(): void;
   setSessionMode(sessionId: SessionId, modeId: string): Promise<void>;
   setSessionModel(sessionId: SessionId, model: string): Promise<void>;
   prompt(options: PromptExecutionOptions): Promise<PromptResponse>;

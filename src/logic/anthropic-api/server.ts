@@ -140,7 +140,6 @@ export class AnthropicHttpServer implements FacadeHttpServer {
         const turn = await this.facade.handleMessages(headers, body, abortController.signal);
 
         response.setHeader(this.config.sessionHeader, turn.sessionId);
-
         writeJson(response, 200, turn.message);
         return;
       }

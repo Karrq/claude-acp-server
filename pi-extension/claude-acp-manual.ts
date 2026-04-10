@@ -664,12 +664,12 @@ export default function (pi: ExtensionAPI) {
         const sessionId = currentSessionId || generateSessionId(ctx.sessionManager.getSessionFile());
         currentSessionId = sessionId;
         debug(`Session ID: ${sessionId.slice(0, 32)}`);
-        
+
         const { port, apiKey, process: proc } = await startServer(ctx.cwd, sessionId);
         serverProcess = proc;
         serverPort = port;
         ephemeralApiKey = apiKey;
-        
+
         pi.unregisterProvider("claude-acp");
         pi.registerProvider("claude-acp", {
           baseUrl: `http://127.0.0.1:${port}`,
@@ -685,7 +685,7 @@ export default function (pi: ExtensionAPI) {
             maxTokens: 16384
           }]
         });
-        
+
         ctx.ui.notify(`Claude ACP ready on port ${port}`, "success");
       } catch (err) {
         debug(`Failed to start: ${err}`);
@@ -729,7 +729,7 @@ export default function (pi: ExtensionAPI) {
         serverProcess = proc;
         serverPort = port;
         ephemeralApiKey = apiKey;
-        
+
         try { pi.unregisterProvider("claude-acp"); } catch {}
         pi.registerProvider("claude-acp", {
           baseUrl: `http://127.0.0.1:${port}`,
@@ -737,7 +737,7 @@ export default function (pi: ExtensionAPI) {
           apiKey,
           models: [{ id: "default", name: "Claude ACP", reasoning: false, input: ["text", "image"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200000, maxTokens: 16384 }]
         });
-        
+
         ctx.ui.notify(`Claude ACP restarted on port ${port}`, "success");
       } catch (err) {
         ctx.ui.notify(`Failed to start: ${err}`, "error");

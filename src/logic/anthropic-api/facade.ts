@@ -53,7 +53,24 @@ const MODEL_ALIASES: Record<string, string> = {
   opus: "default",
 };
 
+/**
+ * Count assistant messages in an Anthropic request. Used to detect when the
+ * client's message history has diverged from the ACP backend's stateful
+ * session (e.g. after compaction, handover, or tree navigation).
+ */
+function countAssistantMessages(body: MessageCreateParamsBase): number {
+  return body.messages.filter((m) => m.role === "assistant").length;
+}
+
 export class AnthropicAcpFacade implements AnthropicFacade {
+  /**
+   * Number of assistant turns the ACP backend has produced in the current
+   * session. When Pi compacts, hands over, or navigates the conversation tree,
+   * it sends fewer assistant messages than this count, which triggers a session
+   * reset so the backend starts fresh with the new context.
+   */
+  private assistantTurnCount = 0;
+
   constructor(
     private readonly backend: BackendManager,
     private readonly translator: PromptTranslator,
@@ -114,7 +131,19 @@ export class AnthropicAcpFacade implements AnthropicFacade {
       return this.handleContinuation(sessionId, requestedModel, streamObserver);
     }
 
-    // First request (or continuation with no buffer — shouldn't happen)
+    // Detect session reset: the client sent fewer assistant messages than
+    // the backend has produced. This happens after compaction, handover, or
+    // tree navigation (fork/rewind). Create a fresh ACP session and send
+    // the full message transcript so the backend picks up the new context.
+    const incomingAssistantCount = countAssistantMessages(body);
+    const isSessionReset = this.assistantTurnCount > 0 && incomingAssistantCount < this.assistantTurnCount;
+    debugLog(`handleMessages: assistantTurnCount=${this.assistantTurnCount} incoming=${incomingAssistantCount} isReset=${isSessionReset}`);
+
+    if (isSessionReset) {
+      return this.handleSessionReset(sessionId, body, requestedModel, signal, streamObserver);
+    }
+
+    // Normal path: incremental prompt
     return this.handleInitialPrompt(sessionId, body, requestedModel, signal, streamObserver);
   }
 
@@ -143,9 +172,15 @@ export class AnthropicAcpFacade implements AnthropicFacade {
       hasPriorSession: false,
     });
 
-    const promptRequest = this.translator.toIncrementalPromptRequest(sessionId, body);
+    // If the client sends prior conversation history on what is effectively
+    // the first turn (e.g. after a server restart, handover, or compact),
+    // send the full transcript so the new session picks up the context.
+    const needsTranscript = this.assistantTurnCount === 0 && countAssistantMessages(body) > 0;
+    const promptRequest = needsTranscript
+      ? this.translator.toPromptRequest(sessionId, body)
+      : this.translator.toIncrementalPromptRequest(sessionId, body);
 
-    debugLog(`handleInitialPrompt: starting backend.prompt() streaming=${!!streamObserver}`);
+    debugLog(`handleInitialPrompt: starting backend.prompt() streaming=${!!streamObserver} needsTranscript=${needsTranscript}`);
 
     if (streamObserver) {
       return this.streamInitialPrompt(sessionId, body, model, signal, streamObserver, buffer, initialUsage, promptRequest);
@@ -170,6 +205,101 @@ export class AnthropicAcpFacade implements AnthropicFacade {
     }
 
     const turn = this.translateChunk(firstChunk, sessionId, model, initialUsage, response);
+    this.assistantTurnCount++;
+
+    if (firstChunk.stopReason === "end_turn") {
+      clearTurnBuffer(sessionId);
+    }
+
+    return turn;
+  }
+
+  /**
+   * Handle a session reset caused by compaction, handover, or tree navigation.
+   * Creates a fresh ACP session, then sends the full message transcript via
+   * toPromptRequest so the backend picks up the new context.
+   */
+  private async handleSessionReset(
+    oldSessionId: string,
+    body: MessageCreateParamsBase,
+    model: string,
+    signal: AbortSignal | undefined,
+    streamObserver: {
+      onReady: (meta: { sessionId: string; requestId: string }) => void | Promise<void>;
+      onEvent: (event: RawMessageStreamEvent) => void | Promise<void>;
+    } | undefined,
+  ): Promise<FinalizedAnthropicTurn> {
+    this.logger.log(
+      `[claude-acp-server] session reset detected (had ${this.assistantTurnCount} turns, client sent ${countAssistantMessages(body)}). Creating fresh ACP session.`,
+    );
+    debugLog(`handleSessionReset: old=${oldSessionId.slice(0, 8)} turns=${this.assistantTurnCount} incoming=${countAssistantMessages(body)}`);
+
+    // Clear state from the old session
+    clearTurnBuffer(oldSessionId);
+    this.assistantTurnCount = 0;
+    this.backend.resetSession();
+
+    // Create a fresh ACP session
+    const requestedCwd = inferWorkingDirectoryFromRequest(body) ?? undefined;
+    const ensured = await this.backend.ensureSession(undefined, requestedCwd);
+    const sessionId = ensured.sessionId;
+    debugLog(`handleSessionReset: new session=${sessionId.slice(0, 8)}`);
+
+    // Re-apply permission mode and model on the new session
+    if (this.config.permissionMode && ensured.modes?.availableModes?.length) {
+      const targetMode = ensured.modes.availableModes.find(
+        (m) => m.id === this.config.permissionMode,
+      );
+      if (targetMode) {
+        try {
+          await this.backend.setSessionMode(sessionId, targetMode.id);
+        } catch (err) {
+          this.logger.warn("[claude-acp-server] failed to set permission mode on reset session", err);
+        }
+      }
+    }
+
+    const backendModel = MODEL_ALIASES[model] ?? model;
+    if (ensured.models?.availableModels?.length) {
+      const knownModelIds = new Set(ensured.models.availableModels.map((e) => e.modelId));
+      if (knownModelIds.has(backendModel)) {
+        await this.backend.setSessionModel(sessionId, backendModel);
+      }
+    }
+
+    // Use the full message translator instead of incremental - this sends the
+    // entire conversation transcript as context for the new session
+    const buffer = getTurnBuffer(sessionId);
+    const initialUsage = estimateProvisionalStreamUsage({
+      request: body,
+      hasPriorSession: false,
+    });
+    const promptRequest = this.translator.toPromptRequest(sessionId, body);
+
+    debugLog(`handleSessionReset: sending full transcript prompt, messages=${body.messages.length}`);
+
+    if (streamObserver) {
+      return this.streamInitialPrompt(sessionId, body, model, signal, streamObserver, buffer, initialUsage, promptRequest);
+    }
+
+    // Non-streaming path
+    const response = await this.backend.prompt({
+      sessionId,
+      request: promptRequest,
+      signal,
+      onNotification: (notification) => {
+        buffer.pushNotification(notification);
+      },
+    });
+
+    buffer.finalize(response);
+    const firstChunk = await buffer.waitForNextChunk();
+    if (!firstChunk) {
+      throw new Error("No chunks produced from backend prompt");
+    }
+
+    const turn = this.translateChunk(firstChunk, sessionId, model, initialUsage, response);
+    this.assistantTurnCount++;
 
     if (firstChunk.stopReason === "end_turn") {
       clearTurnBuffer(sessionId);
@@ -290,6 +420,8 @@ export class AnthropicAcpFacade implements AnthropicFacade {
       await streamObserver.onEvent(allEvents[i]);
     }
 
+    this.assistantTurnCount++;
+
     if (stopReason === "end_turn") {
       clearTurnBuffer(sessionId);
     }
@@ -346,7 +478,9 @@ export class AnthropicAcpFacade implements AnthropicFacade {
 
     // Stream the chunk's notifications through a collector for incremental SSE delivery
     if (streamObserver) {
-      return this.streamChunk(chunk, sessionId, model, streamObserver);
+      const turn = await this.streamChunk(chunk, sessionId, model, streamObserver);
+      this.assistantTurnCount++;
+      return turn;
     }
 
     // Non-streaming: batch translate as before
@@ -355,6 +489,7 @@ export class AnthropicAcpFacade implements AnthropicFacade {
       cache_creation_input_tokens: 0,
       cache_read_input_tokens: 0,
     }, null);
+    this.assistantTurnCount++;
 
     if (chunk.stopReason === "end_turn") {
       clearTurnBuffer(sessionId);

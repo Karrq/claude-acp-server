@@ -46,6 +46,7 @@ function debugLog(msg: string): void {
 }
 debugLog("backend-manager.ts loaded");
 
+
 type PromptListener = (notification: SessionNotification) => void | Promise<void>;
 
 export class AcpBackendManager implements BackendManager, Client {
@@ -103,6 +104,7 @@ export class AcpBackendManager implements BackendManager, Client {
           _meta,
         });
         debugLog(`Session resumed: ${resumed.sessionId}`);
+        this.acpSessionId = resumed.sessionId;
         return {
           sessionId: resumed.sessionId,
           modes: resumed.modes,
@@ -126,6 +128,11 @@ export class AcpBackendManager implements BackendManager, Client {
     this.acpSessionId = created.sessionId;
     this.modelsCache = created.models ?? this.modelsCache;
     return created;
+  }
+
+  resetSession(): void {
+    debugLog("resetSession: clearing cached ACP session ID");
+    this.acpSessionId = null;
   }
 
   async setSessionMode(sessionId: SessionId, modeId: string): Promise<void> {
