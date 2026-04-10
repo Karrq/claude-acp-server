@@ -784,7 +784,7 @@ export default function (pi: ExtensionAPI) {
     pi.registerProvider("claude-acp", {
       baseUrl: `http://127.0.0.1:${port}`,
       api: "anthropic-messages",
-      apiKey,
+      apiKey: clientApiKey,
       streamSimple: createAcpStreamSimple(sessionIdStore),
       models,
     });
