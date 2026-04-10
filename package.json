@@ -21,6 +21,9 @@
   "files": [
     "dist/",
     "!dist/tests/",
+    "shared/",
+    "openclaw-plugin/",
+    "pi-extension/",
     "README.md",
     "LICENSE",
     "package.json"
@@ -57,6 +60,14 @@
     "url": "git+https://github.com/0xSero/claude-acp-server.git"
   },
   "author": "0xSero",
+  "openclaw": {
+    "extensions": ["./openclaw-plugin/index.ts"],
+    "providers": ["claude-acp"],
+    "compat": {
+      "pluginApi": ">=2026.3.24-beta.2",
+      "minGatewayVersion": "2026.3.24-beta.2"
+    }
+  },
   "license": "Apache-2.0",
   "dependencies": {
     "@agentclientprotocol/sdk": "0.18.0",
