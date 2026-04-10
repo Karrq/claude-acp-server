@@ -1,0 +1,27 @@
+{
+  "id": "claude-acp",
+  "name": "Claude ACP Provider",
+  "description": "OpenClaw provider plugin for claude-acp-server — runs Claude Code via the ACP protocol behind an Anthropic-compatible HTTP facade",
+  "providers": ["claude-acp"],
+  "modelSupport": {
+    "modelPrefixes": ["claude-acp/"]
+  },
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "backendCommand": {
+        "type": "string",
+        "description": "ACP backend command (default: npx)"
+      },
+      "backendArgs": {
+        "type": "string",
+        "description": "ACP backend args (default: -y @agentclientprotocol/claude-agent-acp)"
+      },
+      "serverDistPath": {
+        "type": "string",
+        "description": "Override path to claude-acp-server dist/index.js"
+      }
+    },
+    "additionalProperties": false
+  }
+}
