@@ -369,13 +369,28 @@ function clearToolResults(): void {
   try { rmSync(RESULTS_DIR, { recursive: true }); } catch {}
 }
 
-// Global state
-let serverProcess: ChildProcess | null = null;
-let serverPort = 14319;
-let ephemeralApiKey: string | null = null;
-let currentSessionId: string | null = null;
-let mcpDir: string | null = null;
+// Per-instance state keyed by a unique instance ID.
+// Each Pi session gets its own server process so multiple sessions
+// can run concurrently without interfering with each other.
+interface AcpInstance {
+  process: ChildProcess | null;
+  port: number;
+  apiKey: string | null;
+  sessionId: string | null;
+  mcpDir: string | null;
+}
+
+const instances = new Map<string, AcpInstance>();
 let appendSystemContent: string | null = null;
+
+function getOrCreateInstance(id: string): AcpInstance {
+  let inst = instances.get(id);
+  if (!inst) {
+    inst = { process: null, port: 14319, apiKey: null, sessionId: null, mcpDir: null };
+    instances.set(id, inst);
+  }
+  return inst;
+}
 
 function loadAppendSystem(): string | null {
   if (appendSystemContent !== null) return appendSystemContent;
@@ -424,23 +439,17 @@ function findFreePort(startPort: number): Promise<number> {
   });
 }
 
-async function startServer(cwd: string, sessionId: string): Promise<{ port: number; apiKey: string; process: ChildProcess }> {
-  debug(`startServer: cwd=${cwd} sessionId=${sessionId} serverPort=${serverPort}`);
-  
-  // Free the port by killing anything still bound to it (handles orphans from
-  // crashed Pi sessions that stopServer couldn't clean up).
-  try {
-    const { execSync } = require("node:child_process");
-    const result = execSync(`lsof -ti :${serverPort} 2>/dev/null`, { encoding: "utf8" }).trim();
-    if (result) {
-      for (const pid of result.split("\n").filter(Boolean)) {
-        try { process.kill(Number(pid), "SIGKILL"); } catch {}
-      }
-      debug(`startServer: killed processes on port ${serverPort}: ${result}`);
-    }
-  } catch {}
-  
-  const port = await findFreePort(serverPort);
+async function startServer(cwd: string, sessionId: string, inst: AcpInstance): Promise<{ port: number; apiKey: string; process: ChildProcess }> {
+  debug(`startServer: cwd=${cwd} sessionId=${sessionId}`);
+
+  // Kill only this instance's old process (if any) before finding a free port.
+  if (inst.process && !inst.process.killed) {
+    inst.process.kill("SIGKILL");
+    inst.process = null;
+    debug(`startServer: killed previous process for this instance`);
+  }
+
+  const port = await findFreePort(14319);
   debug(`startServer: found free port ${port}`);
   const apiKey = generateApiKey();
   const customPrompt = loadAppendSystem();
@@ -520,51 +529,116 @@ async function startServer(cwd: string, sessionId: string): Promise<{ port: numb
   return { port, apiKey, process: proc };
 }
 
-async function stopServer(): Promise<void> {
-  if (serverProcess && !serverProcess.killed) {
-    serverProcess.kill("SIGTERM");
+async function stopInstance(inst: AcpInstance): Promise<void> {
+  if (inst.process && !inst.process.killed) {
+    inst.process.kill("SIGTERM");
     await new Promise(r => setTimeout(r, 500));
-    if (!serverProcess.killed) serverProcess.kill("SIGKILL");
-    serverProcess = null;
-    ephemeralApiKey = null;
+    if (!inst.process.killed) inst.process.kill("SIGKILL");
+    inst.process = null;
+    inst.apiKey = null;
   }
-  // Kill ALL lingering ACP server processes (not just the one we tracked)
-  // This handles orphans from previous Pi sessions or extension reloads.
-  try {
-    const { execSync } = require("node:child_process");
-    // Kill by the server script path — matches any node process running our server
-    const result = execSync(
-      `pgrep -f "node.*claude-acp-server-fork/dist/index.js" 2>/dev/null`,
-      { encoding: "utf8" }
-    ).trim();
-    if (result) {
-      for (const pid of result.split("\n").filter(Boolean)) {
-        try {
-          process.kill(Number(pid), "SIGKILL");
-          debug(`Killed orphan ACP server PID ${pid}`);
-        } catch {}
-      }
-    }
-  } catch {}
-  // Also free up the port if anything survived
-  try {
-    const { execSync } = require("node:child_process");
-    const result = execSync(`lsof -ti :${serverPort} 2>/dev/null`, { encoding: "utf8" }).trim();
-    if (result) {
-      for (const pid of result.split("\n").filter(Boolean)) {
-        try { process.kill(Number(pid), "SIGKILL"); } catch {}
-      }
-      debug(`Killed lingering processes on port ${serverPort}: ${result}`);
-    }
-  } catch {}
-  if (mcpDir) {
-    try { rmSync(mcpDir, { recursive: true }); } catch {}
-    mcpDir = null;
+  if (inst.mcpDir) {
+    try { rmSync(inst.mcpDir, { recursive: true }); } catch {}
+    inst.mcpDir = null;
   }
   clearToolResults();
 }
 
+// Fetch the model list from a running ACP server and return ProviderModelConfig[].
+async function fetchModelsFromBackend(port: number, apiKey: string): Promise<{ id: string; name: string; reasoning: boolean; input: ("text" | "image")[]; cost: { input: number; output: number; cacheRead: number; cacheWrite: number }; contextWindow: number; maxTokens: number }[]> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/v1/models`, {
+      headers: {
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+    });
+    if (!res.ok) {
+      debug(`fetchModelsFromBackend: HTTP ${res.status}`);
+      return [];
+    }
+    const body = await res.json() as { data?: { id: string; display_name?: string }[] };
+    const models = body.data ?? [];
+    debug(`fetchModelsFromBackend: got ${models.length} models: ${models.map(m => m.id).join(", ")}`);
+    return models.map(m => ({
+      id: m.id,
+      name: m.display_name || m.id,
+      reasoning: false,
+      input: ["text", "image"] as ("text" | "image")[],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 200000,
+      maxTokens: 16384,
+    }));
+  } catch (err) {
+    debug(`fetchModelsFromBackend: ${err}`);
+    return [];
+  }
+}
+
+// Check if the ACP server is reachable.
+async function isServerReachable(inst: AcpInstance): Promise<boolean> {
+  if (!inst.process || inst.process.killed || !inst.apiKey) return false;
+  try {
+    const res = await fetch(`http://127.0.0.1:${inst.port}/v1/models`, {
+      headers: {
+        "x-api-key": inst.apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      signal: AbortSignal.timeout(3000),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
 export default function (pi: ExtensionAPI) {
+  // Derive a stable instance ID from the Pi process PID so each Pi session
+  // gets its own isolated server. Falls back to a random ID.
+  const instanceId = `pi-${process.pid}-${randomBytes(4).toString("hex")}`;
+  const inst = getOrCreateInstance(instanceId);
+
+  // Helper: start the server, fetch dynamic models, and register the provider.
+  async function startAndRegister(cwd: string, sessionId: string, ctx: any): Promise<void> {
+    const { port, apiKey, process: proc } = await startServer(cwd, sessionId, inst);
+    inst.process = proc;
+    inst.port = port;
+    inst.apiKey = apiKey;
+
+    // Fetch the real model list from the backend
+    const backendModels = await fetchModelsFromBackend(port, apiKey);
+    const models = backendModels.length > 0
+      ? backendModels
+      : [{ id: "default", name: "Claude ACP", reasoning: false as const, input: ["text", "image"] as ("text" | "image")[], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200000, maxTokens: 16384 }];
+
+    debug(`startAndRegister: registering provider with ${models.length} models: ${models.map(m => m.id).join(", ")}`);
+
+    try { pi.unregisterProvider("claude-acp"); } catch {}
+    pi.registerProvider("claude-acp", {
+      baseUrl: `http://127.0.0.1:${port}`,
+      api: "anthropic-messages",
+      apiKey,
+      models,
+    });
+
+    const modelNames = models.map(m => m.name || m.id).join(", ");
+    ctx.ui.notify(`Claude ACP ready on port ${port} (${models.length} models: ${modelNames})`, "success");
+  }
+
+  // Helper: ensure the server is running, restarting if unreachable.
+  async function ensureServerRunning(cwd: string, ctx: any): Promise<void> {
+    const reachable = await isServerReachable(inst);
+    if (reachable) {
+      debug(`ensureServerRunning: server is reachable on port ${inst.port}`);
+      return;
+    }
+    debug(`ensureServerRunning: server unreachable, restarting`);
+    ctx.ui.notify("Claude ACP server unreachable, restarting...", "warning");
+    const sessionId = inst.sessionId || generateSessionId(ctx.sessionManager.getSessionFile());
+    inst.sessionId = sessionId;
+    await startAndRegister(cwd, sessionId, ctx);
+  }
+
   // ── Register ACP tools with open schemas ────────────────────────────
   // Pi executes these when it sees tool_use blocks in the response.
   // They return cached results written by the fork's translator.
@@ -599,40 +673,40 @@ export default function (pi: ExtensionAPI) {
   // ── Strip Pi context from ACP requests ─────────────────────────────
   pi.on("before_provider_request", async (event, ctx) => {
     const payload = event.payload;
-    
+
     if (ctx.model?.provider !== "claude-acp") return;
-    
+
     debug(`=== REQUEST === model=${(payload as any).model} msgs=${payload.messages?.length} tools=${payload.tools?.length}`);
-    
+
     if (payload.messages && payload.messages.length > 0) {
       const lastMsg = payload.messages[payload.messages.length - 1];
-      const lastContent = Array.isArray(lastMsg.content) 
+      const lastContent = Array.isArray(lastMsg.content)
         ? lastMsg.content.map((b: any) => b.type).join(", ")
         : typeof lastMsg.content === "string" ? "text" : "unknown";
       debug(`Last msg: role=${lastMsg.role} types=[${lastContent}]`);
-      
+
       if (lastMsg.role === "user" && Array.isArray(lastMsg.content)) {
         const hasToolResult = lastMsg.content.some((b: any) => b.type === "tool_result");
         const hasUserText = lastMsg.content.some((b: any) => b.type === "text" && b.text?.trim());
         debug(`tool_result=${hasToolResult} user_text=${hasUserText}`);
       }
     }
-    
+
     // Remove Pi system prompt
     if (payload.system) {
       delete payload.system;
       debug("Stripped system prompt");
     }
-    
+
     // Clear Pi tools
     if (payload.tools && Array.isArray(payload.tools)) {
       payload.tools = [];
     }
-    
+
     return payload;
   });
 
-  // ── Register provider ─────────────────────────────────────────────
+  // ── Register provider (placeholder until server starts) ───────────
   pi.registerProvider("claude-acp", {
     baseUrl: "http://127.0.0.1:1",
     api: "anthropic-messages",
@@ -647,92 +721,42 @@ export default function (pi: ExtensionAPI) {
       maxTokens: 16384
     }]
   });
-  
+
   // ── Setup/teardown on model selection ───────────────────────────────
   pi.on("model_select", async (event, ctx) => {
     const wasAcp = event.previousModel?.provider === "claude-acp";
     const isAcp = event.model?.provider === "claude-acp";
-    
+
     if (wasAcp && !isAcp) {
-      await stopServer();
+      await stopInstance(inst);
       ctx.ui.notify("Claude ACP stopped", "info");
       return;
     }
-    
+
     if (isAcp && !wasAcp) {
       try {
-        const sessionId = currentSessionId || generateSessionId(ctx.sessionManager.getSessionFile());
-        currentSessionId = sessionId;
+        const sessionId = inst.sessionId || generateSessionId(ctx.sessionManager.getSessionFile());
+        inst.sessionId = sessionId;
         debug(`Session ID: ${sessionId.slice(0, 32)}`);
-
-        const { port, apiKey, process: proc } = await startServer(ctx.cwd, sessionId);
-        serverProcess = proc;
-        serverPort = port;
-        ephemeralApiKey = apiKey;
-
-        pi.unregisterProvider("claude-acp");
-        pi.registerProvider("claude-acp", {
-          baseUrl: `http://127.0.0.1:${port}`,
-          api: "anthropic-messages",
-          apiKey: apiKey,
-          models: [{
-            id: "default",
-            name: "Claude ACP",
-            reasoning: false,
-            input: ["text", "image"],
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-            contextWindow: 200000,
-            maxTokens: 16384
-          }]
-        });
-
-        ctx.ui.notify(`Claude ACP ready on port ${port}`, "success");
+        await startAndRegister(ctx.cwd, sessionId, ctx);
       } catch (err) {
         debug(`Failed to start: ${err}`);
         ctx.ui.notify(`Failed to start Claude ACP: ${err}`, "error");
       }
     }
   });
-  
-  // On session start: kill orphans and restart the server if the model is
+
+  // On session start: restart the server for THIS instance if the model is
   // already claude-acp (e.g. after /new, resume, or fork where session_shutdown
   // killed the server but model_select won't fire because the model didn't change).
   pi.on("session_start", async (event, ctx) => {
-    try {
-      const { execSync } = require("node:child_process");
-      const result = execSync(
-        `pgrep -f "node.*claude-acp-server-fork/dist/index.js" 2>/dev/null`,
-        { encoding: "utf8" }
-      ).trim();
-      if (result) {
-        for (const pid of result.split("\n").filter(Boolean)) {
-          try { process.kill(Number(pid), "SIGKILL"); } catch {}
-        }
-        debug(`session_start: killed orphan ACP servers: ${result}`);
-      }
-    } catch {}
-
-    // Restart the server if the active model is still claude-acp
     if (ctx.model?.provider === "claude-acp") {
-      debug(`session_start: model is claude-acp, restarting server (reason=${event.reason})`);
+      debug(`session_start: model is claude-acp, ensuring server is running`);
       const sessionId = generateSessionId(ctx.sessionManager.getSessionFile());
-      currentSessionId = sessionId;
+      inst.sessionId = sessionId;
 
       try {
-        const { port, apiKey, process: proc } = await startServer(ctx.cwd, sessionId);
-        serverProcess = proc;
-        serverPort = port;
-        ephemeralApiKey = apiKey;
-
-        try { pi.unregisterProvider("claude-acp"); } catch {}
-        pi.registerProvider("claude-acp", {
-          baseUrl: `http://127.0.0.1:${port}`,
-          api: "anthropic-messages",
-          apiKey,
-          models: [{ id: "default", name: "Claude ACP", reasoning: false, input: ["text", "image"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200000, maxTokens: 16384 }]
-        });
-
-        ctx.ui.notify(`Claude ACP ready on port ${port}`, "success");
+        await startAndRegister(ctx.cwd, sessionId, ctx);
       } catch (err) {
         debug(`session_start: failed to restart server: ${err}`);
         ctx.ui.notify(`Failed to start Claude ACP: ${err}`, "error");
@@ -740,55 +764,58 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("session_shutdown", async () => {
-    await stopServer();
-    currentSessionId = null;
+  // Auto-restart: before each agent turn, check if the server is still reachable.
+  pi.on("before_agent_start", async (_event, ctx) => {
+    if (ctx.model?.provider !== "claude-acp") return;
+    await ensureServerRunning(ctx.cwd, ctx);
   });
-  
+
+  pi.on("session_shutdown", async () => {
+    await stopInstance(inst);
+    inst.sessionId = null;
+    instances.delete(instanceId);
+  });
+
   // ── Commands ──────────────────────────────────────────────────────
   pi.registerCommand("acp-restart", {
     description: "Restart/start Claude ACP server",
     handler: async (_args, ctx) => {
-      if (serverProcess && !serverProcess.killed) await stopServer();
-      const sessionId = currentSessionId || generateSessionId(ctx.sessionManager.getSessionFile());
-      currentSessionId = sessionId;
-      
+      await stopInstance(inst);
+      const sessionId = inst.sessionId || generateSessionId(ctx.sessionManager.getSessionFile());
+      inst.sessionId = sessionId;
+
       try {
-        const { port, apiKey, process: proc } = await startServer(ctx.cwd, sessionId);
-        serverProcess = proc;
-        serverPort = port;
-        ephemeralApiKey = apiKey;
-
-        try { pi.unregisterProvider("claude-acp"); } catch {}
-        pi.registerProvider("claude-acp", {
-          baseUrl: `http://127.0.0.1:${port}`,
-          api: "anthropic-messages",
-          apiKey,
-          models: [{ id: "default", name: "Claude ACP", reasoning: false, input: ["text", "image"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200000, maxTokens: 16384 }]
-        });
-
-        ctx.ui.notify(`Claude ACP restarted on port ${port}`, "success");
+        await startAndRegister(ctx.cwd, sessionId, ctx);
       } catch (err) {
         ctx.ui.notify(`Failed to start: ${err}`, "error");
       }
     }
   });
-  
+
   pi.registerCommand("acp-stop", {
     description: "Stop Claude ACP server",
     handler: async (_args, ctx) => {
-      await stopServer();
+      await stopInstance(inst);
       ctx.ui.notify("Claude ACP stopped", "success");
     }
   });
-  
+
   pi.registerCommand("acp-status", {
     description: "Show Claude ACP status",
     handler: async (_args, ctx) => {
-      ctx.ui.notify(serverProcess && !serverProcess.killed ? `Running on port ${serverPort}` : "Not running", "info");
+      const running = inst.process && !inst.process.killed;
+      const allInstances = Array.from(instances.entries())
+        .map(([id, i]) => `  ${id === instanceId ? ">" : " "} ${id.slice(0, 16)}... port=${i.port} ${i.process && !i.process.killed ? "running" : "stopped"}`)
+        .join("\n");
+      ctx.ui.notify(
+        `${running ? `Running on port ${inst.port}` : "Not running"}\n` +
+        `Instance: ${instanceId.slice(0, 16)}...\n` +
+        `All instances:\n${allInstances}`,
+        "info"
+      );
     }
   });
-  
+
   pi.registerCommand("acp-logs", {
     description: "Show ACP debug logs",
     handler: async (_args, ctx) => {
