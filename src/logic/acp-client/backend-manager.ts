@@ -57,7 +57,6 @@ export class AcpBackendManager implements BackendManager, Client {
   private readonly sessionLocks = new Map<SessionId, Promise<void>>();
   private readonly terminalManager: TerminalManager;
   private modelsCache: NewSessionResponse["models"] | null = null;
-  private acpSessionId: SessionId | null = null;
 
   constructor(
     private readonly config: ServerConfig,
@@ -78,14 +77,11 @@ export class AcpBackendManager implements BackendManager, Client {
     const claudeCodeOptions = process.env.CLAUDE_ACP_OPTIONS
       ? JSON.parse(process.env.CLAUDE_ACP_OPTIONS)
       : undefined;
-    // DEBUG: Log what we received
     if (claudeCodeOptions) {
       debugLog(`CLAUDE_ACP_OPTIONS received: ${JSON.stringify(claudeCodeOptions).slice(0, 500)}`);
     } else {
       debugLog("No CLAUDE_ACP_OPTIONS set");
     }
-    // The ACP expects _meta.claudeCode.options, not _meta.claudeCode directly
-    // Also handle systemPrompt which should be at _meta level
     const { systemPrompt, ...otherOptions } = claudeCodeOptions || {};
     const _meta: any = claudeCodeOptions ? { claudeCode: { options: otherOptions } } : undefined;
     if (systemPrompt) {
@@ -93,18 +89,17 @@ export class AcpBackendManager implements BackendManager, Client {
       debugLog(`Using custom systemPrompt: ${systemPrompt.slice(0, 100)}...`);
     }
 
-    // If we have a cached ACP session ID, try to resume it first
-    if (this.acpSessionId) {
-      debugLog(`Resuming cached session: ${this.acpSessionId}`);
+    // If the client provided a session ID, resume it
+    if (sessionId) {
+      debugLog(`Resuming session: ${sessionId}`);
       try {
         const resumed = await connection.unstable_resumeSession({
-          sessionId: this.acpSessionId,
+          sessionId,
           cwd: sessionCwd,
           mcpServers: [],
           _meta,
         });
         debugLog(`Session resumed: ${resumed.sessionId}`);
-        this.acpSessionId = resumed.sessionId;
         return {
           sessionId: resumed.sessionId,
           modes: resumed.modes,
@@ -116,7 +111,7 @@ export class AcpBackendManager implements BackendManager, Client {
       }
     }
 
-    // No cached session or resume failed — create a new one
+    // No session ID or resume failed - create a new one
     debugLog("Creating NEW session");
     debugLog(`_meta being sent: ${JSON.stringify(_meta).slice(0, 500)}`);
     const created = await connection.newSession({
@@ -125,14 +120,13 @@ export class AcpBackendManager implements BackendManager, Client {
       _meta,
     });
     debugLog(`New session created: ${created.sessionId}`);
-    this.acpSessionId = created.sessionId;
     this.modelsCache = created.models ?? this.modelsCache;
     return created;
   }
 
-  resetSession(): void {
-    debugLog("resetSession: clearing cached ACP session ID");
-    this.acpSessionId = null;
+  /** No-op kept for interface compatibility. Session lifecycle is now client-driven. */
+  resetSession(_clientId?: string): void {
+    debugLog("resetSession: no-op (session lifecycle is client-driven)");
   }
 
   async setSessionMode(sessionId: SessionId, modeId: string): Promise<void> {

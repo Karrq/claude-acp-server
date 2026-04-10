@@ -63,39 +63,58 @@ function buildRoleSequence(body: MessageCreateParamsBase): string[] {
   return body.messages.map((m) => (m.role === "assistant" ? "a" : "u"));
 }
 
+/**
+ * Per-session conversation tracking state.
+ * Keyed by the ACP session ID so multiple concurrent sessions
+ * get isolated role sequence tracking.
+ */
+interface SessionState {
+  expectedRoleSequence: string[];
+  hasActiveSession: boolean;
+}
+
 export class AnthropicAcpFacade implements AnthropicFacade {
   /**
-   * Tracks the expected role sequence for the NEXT request. The Messages API
-   * is stateless, so clients that send full history (like Pi) include the
-   * entire conversation each time. After processing a request, we append "a"
-   * for our response to predict what the next request should start with.
+   * Per-session role sequence tracking. The Messages API is stateless, so
+   * clients that send full history include the entire conversation each time.
+   * After processing a request, we append "a" to predict what the next request
+   * should start with.
    *
-   * Comparing the full role sequence (not just counts) detects all forms of
-   * history restructuring: compaction (inserts summary, removes early messages),
-   * tree navigation (truncates or extends), and fork (diverges from a point).
+   * Comparing the full role sequence detects all forms of history restructuring:
+   * compaction, tree navigation, and fork.
    *
-   * Only enforced when the client sends history (assistant messages > 0).
-   * Clients that send only the latest message (like tests) skip the check.
+   * Keyed by ACP session ID so multiple concurrent sessions can share a single
+   * server process without corrupting each other's state.
    */
-  private expectedRoleSequence: string[] = [];
-  private hasActiveSession = false;
+  private sessions = new Map<string, SessionState>();
+
+  private getSession(sessionId: string): SessionState {
+    let state = this.sessions.get(sessionId);
+    if (!state) {
+      state = { expectedRoleSequence: [], hasActiveSession: false };
+      this.sessions.set(sessionId, state);
+    }
+    return state;
+  }
 
   /**
    * Record the role sequence after a successful response. Appends "a" for our
    * response to predict what the next full-history request should start with.
    */
-  private recordTurn(body: MessageCreateParamsBase): void {
-    this.expectedRoleSequence = [...buildRoleSequence(body), "a"];
-    this.hasActiveSession = true;
+  private recordTurn(sessionId: string, body: MessageCreateParamsBase): void {
+    const session = this.getSession(sessionId);
+    session.expectedRoleSequence = [...buildRoleSequence(body), "a"];
+    session.hasActiveSession = true;
   }
 
   /**
    * Extend the expected sequence for a continuation turn (tool_use round-trip).
    * Each continuation adds a user message (tool_result) and an assistant response.
    */
-  private recordContinuationTurn(): void {
-    this.expectedRoleSequence.push("u", "a");
-    this.hasActiveSession = true;
+  private recordContinuationTurn(sessionId: string): void {
+    const session = this.getSession(sessionId);
+    session.expectedRoleSequence.push("u", "a");
+    session.hasActiveSession = true;
   }
 
   constructor(
@@ -118,8 +137,14 @@ export class AnthropicAcpFacade implements AnthropicFacade {
 
     const requestedCwd =
       headers.get(this.config.cwdHeader) ?? inferWorkingDirectoryFromRequest(body) ?? undefined;
-    const ensured = await this.backend.ensureSession(undefined, requestedCwd);
+    // Use x-acp-client-id if provided; fall back to x-acp-session-id for
+    // backwards compatibility (clients that echo the session ID back).
+    const clientId = headers.get("x-acp-client-id")
+      || headers.get(this.config.sessionHeader)
+      || undefined;
+    const ensured = await this.backend.ensureSession(clientId, requestedCwd);
     const sessionId = ensured.sessionId;
+    const session = this.getSession(sessionId);
 
     if (this.config.permissionMode && ensured.modes?.availableModes?.length) {
       const targetMode = ensured.modes.availableModes.find(
@@ -165,8 +190,8 @@ export class AnthropicAcpFacade implements AnthropicFacade {
     const incomingRoles = buildRoleSequence(body);
     const hasHistory = incomingRoles.includes("a");
     let isSessionReset = false;
-    if (hasHistory && this.hasActiveSession) {
-      const expected = this.expectedRoleSequence;
+    if (hasHistory && session.hasActiveSession) {
+      const expected = session.expectedRoleSequence;
       // The incoming sequence must start with our predicted prefix.
       const prefixMatches =
         expected.length <= incomingRoles.length &&
@@ -178,10 +203,10 @@ export class AnthropicAcpFacade implements AnthropicFacade {
       const hasUnknownAssistantHistory = extraRoles.includes("a");
       isSessionReset = !prefixMatches || hasUnknownAssistantHistory;
     }
-    debugLog(`handleMessages: active=${this.hasActiveSession} hasHistory=${hasHistory} expected=[${this.expectedRoleSequence.join(",")}] incoming=[${incomingRoles.join(",")}] isReset=${isSessionReset}`);
+    debugLog(`handleMessages: active=${session.hasActiveSession} hasHistory=${hasHistory} expected=[${session.expectedRoleSequence.join(",")}] incoming=[${incomingRoles.join(",")}] isReset=${isSessionReset}`);
 
     if (isSessionReset) {
-      return this.handleSessionReset(sessionId, body, requestedModel, signal, streamObserver);
+      return this.handleSessionReset(clientId, sessionId, body, requestedModel, signal, streamObserver);
     }
 
     // Normal path: incremental prompt
@@ -206,6 +231,7 @@ export class AnthropicAcpFacade implements AnthropicFacade {
     // Clear any stale buffer from a previous prompt cycle
     clearTurnBuffer(sessionId);
     const buffer = getTurnBuffer(sessionId);
+    const session = this.getSession(sessionId);
 
     const enableToolBridge = shouldEnableToolBridge(body);
     const initialUsage = estimateProvisionalStreamUsage({
@@ -217,7 +243,7 @@ export class AnthropicAcpFacade implements AnthropicFacade {
     // the first turn (e.g. after a server restart, handover, or compact),
     // send the full transcript so the new session picks up the context.
     const incomingRoles = buildRoleSequence(body);
-    const needsTranscript = !this.hasActiveSession && incomingRoles.includes("a");
+    const needsTranscript = !session.hasActiveSession && incomingRoles.includes("a");
     const promptRequest = needsTranscript
       ? this.translator.toPromptRequest(sessionId, body)
       : this.translator.toIncrementalPromptRequest(sessionId, body);
@@ -247,7 +273,7 @@ export class AnthropicAcpFacade implements AnthropicFacade {
     }
 
     const turn = this.translateChunk(firstChunk, sessionId, model, initialUsage, response);
-    this.recordTurn(body);
+    this.recordTurn(sessionId, body);
 
     if (firstChunk.stopReason === "end_turn") {
       clearTurnBuffer(sessionId);
@@ -262,6 +288,7 @@ export class AnthropicAcpFacade implements AnthropicFacade {
    * toPromptRequest so the backend picks up the new context.
    */
   private async handleSessionReset(
+    clientId: string | undefined,
     oldSessionId: string,
     body: MessageCreateParamsBase,
     model: string,
@@ -271,21 +298,21 @@ export class AnthropicAcpFacade implements AnthropicFacade {
       onEvent: (event: RawMessageStreamEvent) => void | Promise<void>;
     } | undefined,
   ): Promise<FinalizedAnthropicTurn> {
+    const oldSession = this.getSession(oldSessionId);
     const incomingRoles = buildRoleSequence(body);
     this.logger.log(
-      `[claude-acp-server] session reset detected (expected [${this.expectedRoleSequence.join(",")}], got [${incomingRoles.join(",")}]). Creating fresh ACP session.`,
+      `[claude-acp-server] session reset detected (expected [${oldSession.expectedRoleSequence.join(",")}], got [${incomingRoles.join(",")}]). Creating fresh ACP session.`,
     );
-    debugLog(`handleSessionReset: old=${oldSessionId.slice(0, 8)} expected=[${this.expectedRoleSequence.join(",")}] incoming=[${incomingRoles.join(",")}]`);
+    debugLog(`handleSessionReset: old=${oldSessionId.slice(0, 8)} expected=[${oldSession.expectedRoleSequence.join(",")}] incoming=[${incomingRoles.join(",")}]`);
 
     // Clear state from the old session
     clearTurnBuffer(oldSessionId);
-    this.hasActiveSession = false;
-    this.expectedRoleSequence = [];
-    this.backend.resetSession();
+    this.sessions.delete(oldSessionId);
+    this.backend.resetSession(clientId);
 
-    // Create a fresh ACP session
+    // Create a fresh ACP session for this client
     const requestedCwd = inferWorkingDirectoryFromRequest(body) ?? undefined;
-    const ensured = await this.backend.ensureSession(undefined, requestedCwd);
+    const ensured = await this.backend.ensureSession(clientId, requestedCwd);
     const sessionId = ensured.sessionId;
     debugLog(`handleSessionReset: new session=${sessionId.slice(0, 8)}`);
 
@@ -343,7 +370,7 @@ export class AnthropicAcpFacade implements AnthropicFacade {
     }
 
     const turn = this.translateChunk(firstChunk, sessionId, model, initialUsage, response);
-    this.recordTurn(body);
+    this.recordTurn(sessionId, body);
 
     if (firstChunk.stopReason === "end_turn") {
       clearTurnBuffer(sessionId);
@@ -464,7 +491,7 @@ export class AnthropicAcpFacade implements AnthropicFacade {
       await streamObserver.onEvent(allEvents[i]);
     }
 
-    this.recordTurn(body);
+    this.recordTurn(sessionId, body);
 
     if (stopReason === "end_turn") {
       clearTurnBuffer(sessionId);
@@ -523,7 +550,7 @@ export class AnthropicAcpFacade implements AnthropicFacade {
     // Stream the chunk's notifications through a collector for incremental SSE delivery
     if (streamObserver) {
       const turn = await this.streamChunk(chunk, sessionId, model, streamObserver);
-      this.recordContinuationTurn();
+      this.recordContinuationTurn(sessionId);
       return turn;
     }
 
@@ -533,7 +560,7 @@ export class AnthropicAcpFacade implements AnthropicFacade {
       cache_creation_input_tokens: 0,
       cache_read_input_tokens: 0,
     }, null);
-    this.recordContinuationTurn();
+    this.recordContinuationTurn(sessionId);
 
     if (chunk.stopReason === "end_turn") {
       clearTurnBuffer(sessionId);

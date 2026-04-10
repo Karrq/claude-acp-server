@@ -611,13 +611,14 @@ export default function (pi: ExtensionAPI) {
       ? backendModels
       : [{ id: "default", name: "Claude ACP", reasoning: false as const, input: ["text", "image"] as ("text" | "image")[], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200000, maxTokens: 16384 }];
 
-    debug(`startAndRegister: registering provider with ${models.length} models: ${models.map(m => m.id).join(", ")}`);
+    debug(`startAndRegister: registering provider with ${models.length} models`);
 
     try { pi.unregisterProvider("claude-acp"); } catch {}
     pi.registerProvider("claude-acp", {
       baseUrl: `http://127.0.0.1:${port}`,
       api: "anthropic-messages",
       apiKey,
+      headers: { "x-acp-client-id": instanceId },
       models,
     });
 
