@@ -694,8 +694,10 @@ export default function (pi: ExtensionAPI) {
     }
   });
   
-  // Kill any orphan ACP servers from previous sessions on startup
-  pi.on("session_start", async () => {
+  // On session start: kill orphans and restart the server if the model is
+  // already claude-acp (e.g. after /new, resume, or fork where session_shutdown
+  // killed the server but model_select won't fire because the model didn't change).
+  pi.on("session_start", async (event, ctx) => {
     try {
       const { execSync } = require("node:child_process");
       const result = execSync(
@@ -709,6 +711,33 @@ export default function (pi: ExtensionAPI) {
         debug(`session_start: killed orphan ACP servers: ${result}`);
       }
     } catch {}
+
+    // Restart the server if the active model is still claude-acp
+    if (ctx.model?.provider === "claude-acp") {
+      debug(`session_start: model is claude-acp, restarting server (reason=${event.reason})`);
+      const sessionId = generateSessionId(ctx.sessionManager.getSessionFile());
+      currentSessionId = sessionId;
+
+      try {
+        const { port, apiKey, process: proc } = await startServer(ctx.cwd, sessionId);
+        serverProcess = proc;
+        serverPort = port;
+        ephemeralApiKey = apiKey;
+
+        try { pi.unregisterProvider("claude-acp"); } catch {}
+        pi.registerProvider("claude-acp", {
+          baseUrl: `http://127.0.0.1:${port}`,
+          api: "anthropic-messages",
+          apiKey,
+          models: [{ id: "default", name: "Claude ACP", reasoning: false, input: ["text", "image"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200000, maxTokens: 16384 }]
+        });
+
+        ctx.ui.notify(`Claude ACP ready on port ${port}`, "success");
+      } catch (err) {
+        debug(`session_start: failed to restart server: ${err}`);
+        ctx.ui.notify(`Failed to start Claude ACP: ${err}`, "error");
+      }
+    }
   });
 
   pi.on("session_shutdown", async () => {

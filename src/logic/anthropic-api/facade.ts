@@ -54,22 +54,49 @@ const MODEL_ALIASES: Record<string, string> = {
 };
 
 /**
- * Count assistant messages in an Anthropic request. Used to detect when the
- * client's message history has diverged from the ACP backend's stateful
- * session (e.g. after compaction, handover, or tree navigation).
+ * Build a simplified role sequence from the messages in a request. Each entry
+ * is "a" (assistant) or "u" (user). Used to detect structural changes in the
+ * conversation history - compaction, tree navigation, fork - by comparing
+ * the incoming sequence against what we expect after the last turn.
  */
-function countAssistantMessages(body: MessageCreateParamsBase): number {
-  return body.messages.filter((m) => m.role === "assistant").length;
+function buildRoleSequence(body: MessageCreateParamsBase): string[] {
+  return body.messages.map((m) => (m.role === "assistant" ? "a" : "u"));
 }
 
 export class AnthropicAcpFacade implements AnthropicFacade {
   /**
-   * Number of assistant turns the ACP backend has produced in the current
-   * session. When Pi compacts, hands over, or navigates the conversation tree,
-   * it sends fewer assistant messages than this count, which triggers a session
-   * reset so the backend starts fresh with the new context.
+   * Tracks the expected role sequence for the NEXT request. The Messages API
+   * is stateless, so clients that send full history (like Pi) include the
+   * entire conversation each time. After processing a request, we append "a"
+   * for our response to predict what the next request should start with.
+   *
+   * Comparing the full role sequence (not just counts) detects all forms of
+   * history restructuring: compaction (inserts summary, removes early messages),
+   * tree navigation (truncates or extends), and fork (diverges from a point).
+   *
+   * Only enforced when the client sends history (assistant messages > 0).
+   * Clients that send only the latest message (like tests) skip the check.
    */
-  private assistantTurnCount = 0;
+  private expectedRoleSequence: string[] = [];
+  private hasActiveSession = false;
+
+  /**
+   * Record the role sequence after a successful response. Appends "a" for our
+   * response to predict what the next full-history request should start with.
+   */
+  private recordTurn(body: MessageCreateParamsBase): void {
+    this.expectedRoleSequence = [...buildRoleSequence(body), "a"];
+    this.hasActiveSession = true;
+  }
+
+  /**
+   * Extend the expected sequence for a continuation turn (tool_use round-trip).
+   * Each continuation adds a user message (tool_result) and an assistant response.
+   */
+  private recordContinuationTurn(): void {
+    this.expectedRoleSequence.push("u", "a");
+    this.hasActiveSession = true;
+  }
 
   constructor(
     private readonly backend: BackendManager,
@@ -131,13 +158,27 @@ export class AnthropicAcpFacade implements AnthropicFacade {
       return this.handleContinuation(sessionId, requestedModel, streamObserver);
     }
 
-    // Detect session reset: the client sent fewer assistant messages than
-    // the backend has produced. This happens after compaction, handover, or
-    // tree navigation (fork/rewind). Create a fresh ACP session and send
-    // the full message transcript so the backend picks up the new context.
-    const incomingAssistantCount = countAssistantMessages(body);
-    const isSessionReset = this.assistantTurnCount > 0 && incomingAssistantCount < this.assistantTurnCount;
-    debugLog(`handleMessages: assistantTurnCount=${this.assistantTurnCount} incoming=${incomingAssistantCount} isReset=${isSessionReset}`);
+    // Detect session reset by comparing the incoming role sequence against
+    // what we predicted. Only checked when the request contains assistant
+    // messages (full history). Clients that send only the latest message
+    // (like tests) skip this check.
+    const incomingRoles = buildRoleSequence(body);
+    const hasHistory = incomingRoles.includes("a");
+    let isSessionReset = false;
+    if (hasHistory && this.hasActiveSession) {
+      const expected = this.expectedRoleSequence;
+      // The incoming sequence must start with our predicted prefix.
+      const prefixMatches =
+        expected.length <= incomingRoles.length &&
+        expected.every((role, i) => incomingRoles[i] === role);
+      // Extra trailing user messages are fine (queued messages, followups).
+      // But extra assistant messages mean history the backend doesn't know
+      // about - that requires a transcript to bring the backend up to date.
+      const extraRoles = incomingRoles.slice(expected.length);
+      const hasUnknownAssistantHistory = extraRoles.includes("a");
+      isSessionReset = !prefixMatches || hasUnknownAssistantHistory;
+    }
+    debugLog(`handleMessages: active=${this.hasActiveSession} hasHistory=${hasHistory} expected=[${this.expectedRoleSequence.join(",")}] incoming=[${incomingRoles.join(",")}] isReset=${isSessionReset}`);
 
     if (isSessionReset) {
       return this.handleSessionReset(sessionId, body, requestedModel, signal, streamObserver);
@@ -175,7 +216,8 @@ export class AnthropicAcpFacade implements AnthropicFacade {
     // If the client sends prior conversation history on what is effectively
     // the first turn (e.g. after a server restart, handover, or compact),
     // send the full transcript so the new session picks up the context.
-    const needsTranscript = this.assistantTurnCount === 0 && countAssistantMessages(body) > 0;
+    const incomingRoles = buildRoleSequence(body);
+    const needsTranscript = !this.hasActiveSession && incomingRoles.includes("a");
     const promptRequest = needsTranscript
       ? this.translator.toPromptRequest(sessionId, body)
       : this.translator.toIncrementalPromptRequest(sessionId, body);
@@ -205,7 +247,7 @@ export class AnthropicAcpFacade implements AnthropicFacade {
     }
 
     const turn = this.translateChunk(firstChunk, sessionId, model, initialUsage, response);
-    this.assistantTurnCount++;
+    this.recordTurn(body);
 
     if (firstChunk.stopReason === "end_turn") {
       clearTurnBuffer(sessionId);
@@ -229,14 +271,16 @@ export class AnthropicAcpFacade implements AnthropicFacade {
       onEvent: (event: RawMessageStreamEvent) => void | Promise<void>;
     } | undefined,
   ): Promise<FinalizedAnthropicTurn> {
+    const incomingRoles = buildRoleSequence(body);
     this.logger.log(
-      `[claude-acp-server] session reset detected (had ${this.assistantTurnCount} turns, client sent ${countAssistantMessages(body)}). Creating fresh ACP session.`,
+      `[claude-acp-server] session reset detected (expected [${this.expectedRoleSequence.join(",")}], got [${incomingRoles.join(",")}]). Creating fresh ACP session.`,
     );
-    debugLog(`handleSessionReset: old=${oldSessionId.slice(0, 8)} turns=${this.assistantTurnCount} incoming=${countAssistantMessages(body)}`);
+    debugLog(`handleSessionReset: old=${oldSessionId.slice(0, 8)} expected=[${this.expectedRoleSequence.join(",")}] incoming=[${incomingRoles.join(",")}]`);
 
     // Clear state from the old session
     clearTurnBuffer(oldSessionId);
-    this.assistantTurnCount = 0;
+    this.hasActiveSession = false;
+    this.expectedRoleSequence = [];
     this.backend.resetSession();
 
     // Create a fresh ACP session
@@ -299,7 +343,7 @@ export class AnthropicAcpFacade implements AnthropicFacade {
     }
 
     const turn = this.translateChunk(firstChunk, sessionId, model, initialUsage, response);
-    this.assistantTurnCount++;
+    this.recordTurn(body);
 
     if (firstChunk.stopReason === "end_turn") {
       clearTurnBuffer(sessionId);
@@ -420,7 +464,7 @@ export class AnthropicAcpFacade implements AnthropicFacade {
       await streamObserver.onEvent(allEvents[i]);
     }
 
-    this.assistantTurnCount++;
+    this.recordTurn(body);
 
     if (stopReason === "end_turn") {
       clearTurnBuffer(sessionId);
@@ -479,7 +523,7 @@ export class AnthropicAcpFacade implements AnthropicFacade {
     // Stream the chunk's notifications through a collector for incremental SSE delivery
     if (streamObserver) {
       const turn = await this.streamChunk(chunk, sessionId, model, streamObserver);
-      this.assistantTurnCount++;
+      this.recordContinuationTurn();
       return turn;
     }
 
@@ -489,7 +533,7 @@ export class AnthropicAcpFacade implements AnthropicFacade {
       cache_creation_input_tokens: 0,
       cache_read_input_tokens: 0,
     }, null);
-    this.assistantTurnCount++;
+    this.recordContinuationTurn();
 
     if (chunk.stopReason === "end_turn") {
       clearTurnBuffer(sessionId);

@@ -66,7 +66,7 @@ function renderContentBlockForTranscript(block: ContentBlockParam): string {
     case "image":
       return `[image:${block.source.type === "url" ? block.source.url : block.source.media_type}]`;
     case "tool_result":
-      return `[tool_result:${block.tool_use_id}]`;
+      return `[tool_result:${block.tool_use_id}] ${typeof block.content === "string" ? block.content : JSON.stringify(block.content)}`;
     case "tool_use":
       return `[tool_use:${block.name}:${block.id}] ${JSON.stringify(block.input)}`;
     case "document":
