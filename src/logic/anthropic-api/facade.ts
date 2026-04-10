@@ -10,7 +10,8 @@ import type {
   RawMessageStreamEvent,
 } from "@anthropic-ai/sdk/resources/messages/messages";
 import type { PromptResponse } from "@agentclientprotocol/sdk";
-import { HttpError, requireAnthropicHeaders } from "../../helpers/errors.js";
+import { HttpError } from "../../helpers/errors.js";
+import { ClientRegistry } from "./client-registry.js";
 import {
   estimateProvisionalStreamUsage,
   inferWorkingDirectoryFromRequest,
@@ -88,13 +89,7 @@ export class AnthropicAcpFacade implements AnthropicFacade {
    */
   private sessions = new Map<string, SessionState>();
 
-  /**
-   * Maps stable client-provided IDs to ACP session IDs. Clients that can't
-   * easily read response headers (e.g. Pi extensions using built-in streamSimple)
-   * send a stable x-acp-client-id instead. The server looks up the last session
-   * for that client, avoiding the need for a response-header cookie jar.
-   */
-  private clientSessions = new Map<string, string>();
+  private readonly registry: ClientRegistry;
 
   private getSession(sessionId: string): SessionState {
     let state = this.sessions.get(sessionId);
@@ -130,7 +125,49 @@ export class AnthropicAcpFacade implements AnthropicFacade {
     private readonly translator: PromptTranslator,
     private readonly config: ServerConfig,
     private readonly logger: Logger = console,
-  ) {}
+  ) {
+    this.registry = new ClientRegistry();
+  }
+
+  /**
+   * Validate the anthropic-version header.
+   */
+  private requireVersion(headers: Headers): void {
+    const version = headers.get("anthropic-version");
+    if (!version) {
+      throw new HttpError({
+        status: 400,
+        type: "invalid_request_error",
+        message: "Missing anthropic-version header.",
+      });
+    }
+    if (version !== this.config.anthropicVersion) {
+      throw new HttpError({
+        status: 400,
+        type: "invalid_request_error",
+        message: `Unsupported anthropic-version: ${version}. Expected ${this.config.anthropicVersion}.`,
+      });
+    }
+  }
+
+  /**
+   * Extract the API key from headers and return the client record.
+   * Any key is accepted as a client identity (created on first use).
+   */
+  private authenticateClient(headers: Headers) {
+    const apiKey =
+      headers.get("x-api-key") ??
+      headers.get("authorization")?.replace(/^Bearer\s+/i, "").trim();
+
+    if (!apiKey) {
+      throw new HttpError({
+        status: 401,
+        type: "authentication_error",
+        message: "Missing API key. Provide x-api-key or Authorization: Bearer <key>.",
+      });
+    }
+    return this.registry.authenticate(apiKey);
+  }
 
   async handleMessages(
     headers: Headers,
@@ -141,26 +178,19 @@ export class AnthropicAcpFacade implements AnthropicFacade {
       onEvent: (event: RawMessageStreamEvent) => void | Promise<void>;
     },
   ): Promise<FinalizedAnthropicTurn> {
-    requireAnthropicHeaders(headers, this.config.anthropicVersion, this.config.apiKey);
+    this.requireVersion(headers);
+    const client = this.authenticateClient(headers);
 
     const requestedCwd =
       headers.get(this.config.cwdHeader) ?? inferWorkingDirectoryFromRequest(body) ?? undefined;
-    // Resolve session ID: explicit header takes priority, then client ID lookup.
-    // Clients that can read response headers send x-acp-session-id directly.
-    // Clients that can't (e.g. Pi extension) send a stable x-acp-client-id and
-    // the server looks up the last session for that client.
-    const clientId = headers.get(this.config.clientIdHeader) || undefined;
-    const requestedSessionId =
-      headers.get(this.config.sessionHeader) ||
-      (clientId ? this.clientSessions.get(clientId) : undefined) ||
-      undefined;
-    const ensured = await this.backend.ensureSession(requestedSessionId, requestedCwd);
-    const sessionId = ensured.sessionId;
 
-    // Update client -> session mapping
-    if (clientId) {
-      this.clientSessions.set(clientId, sessionId);
-    }
+    // Session resolution: explicit header (scoped by client) -> client's active session -> new
+    const requestedSessionId = headers.get(this.config.sessionHeader) || undefined;
+    const resolvedSessionId = this.registry.resolveSessionId(client, requestedSessionId);
+
+    const ensured = await this.backend.ensureSession(resolvedSessionId, requestedCwd);
+    const sessionId = ensured.sessionId;
+    this.registry.recordSession(client, sessionId);
     const session = this.getSession(sessionId);
 
     if (this.config.permissionMode && ensured.modes?.availableModes?.length) {
@@ -225,9 +255,7 @@ export class AnthropicAcpFacade implements AnthropicFacade {
     if (isSessionReset) {
       const turn = await this.handleSessionReset(sessionId, body, requestedModel, signal, streamObserver);
       // Update client mapping to point to the new session created by the reset
-      if (clientId) {
-        this.clientSessions.set(clientId, turn.sessionId);
-      }
+      this.registry.recordSession(client, turn.sessionId);
       return turn;
     }
 
@@ -746,7 +774,8 @@ export class AnthropicAcpFacade implements AnthropicFacade {
   }
 
   async listModels(headers: Headers) {
-    requireAnthropicHeaders(headers, this.config.anthropicVersion, this.config.apiKey);
+    this.requireVersion(headers);
+    this.authenticateClient(headers);
     return this.backend.listModels();
   }
 }

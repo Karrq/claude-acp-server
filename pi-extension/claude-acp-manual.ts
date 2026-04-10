@@ -597,8 +597,10 @@ async function isServerReachable(inst: AcpInstance): Promise<boolean> {
 
 // ── Custom streamSimple with session ID cookie jar ──────────────────
 // Uses the Anthropic SDK directly with a custom `fetch` that captures
-// x-acp-session-id from response headers. Also strips Pi's system
-// prompt and tools since the ACP server provides its own.
+// x-acp-session-id from response headers. The client API key (from
+// /v1/register) handles identity and session scoping on the server.
+// The session ID cookie jar provides explicit session control for
+// forking, resuming, etc.
 
 type SessionIdStore = { current: string | null };
 
@@ -749,27 +751,29 @@ function createAcpStreamSimple(sessionIdStore: SessionIdStore) {
 }
 
 export default function (pi: ExtensionAPI) {
-  // Derive a stable instance ID from the Pi process PID so each Pi session
-  // gets its own isolated server. Falls back to a random ID.
+  // Unique per Pi process. Used as both the instance key (for server
+  // lifecycle) and the API key (for server-side session scoping).
   const instanceId = `pi-${process.pid}-${randomBytes(4).toString("hex")}`;
+  const clientApiKey = `acp-${randomBytes(16).toString("hex")}`;
   const inst = getOrCreateInstance(instanceId);
 
   // Session ID store: captures x-acp-session-id from server response headers.
-  // Acts as a cookie jar so the server knows which ACP session to route to.
+  // Provides explicit session control (fork, resume) while the client API key
+  // handles identity and session scoping on the server.
   const sessionIdStore: SessionIdStore = { current: null };
 
   // Helper: start the server, fetch dynamic models, and register the provider.
   async function startAndRegister(cwd: string, sessionId: string, ctx: any): Promise<void> {
-    const { port, apiKey, process: proc } = await startServer(cwd, sessionId, inst);
+    const { port, process: proc } = await startServer(cwd, sessionId, inst);
     inst.process = proc;
     inst.port = port;
-    inst.apiKey = apiKey;
+    inst.apiKey = clientApiKey;
 
-    // Reset the session ID store on server (re)start so the server creates a fresh ACP session
+    // Reset the session ID store on server (re)start
     sessionIdStore.current = null;
 
     // Fetch the real model list from the backend
-    const backendModels = await fetchModelsFromBackend(port, apiKey);
+    const backendModels = await fetchModelsFromBackend(port, clientApiKey);
     const models = backendModels.length > 0
       ? backendModels
       : [{ id: "default", name: "Claude ACP", reasoning: false as const, input: ["text", "image"] as ("text" | "image")[], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200000, maxTokens: 16384 }];
@@ -839,7 +843,7 @@ export default function (pi: ExtensionAPI) {
     baseUrl: "http://127.0.0.1:1",
     api: "anthropic-messages",
     apiKey: "not-started",
-    streamSimple: createAcpStreamSimple(instanceId),
+    streamSimple: createAcpStreamSimple(sessionIdStore),
     models: [{
       id: "default",
       name: "Claude ACP",
