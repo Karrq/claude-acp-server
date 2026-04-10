@@ -33,6 +33,7 @@ export type ServerConfig = {
   anthropicVersion: string;
   traceRequests: boolean;
   sessionHeader: string;
+  clientIdHeader: string;
   requestIdHeader: string;
   backend: BackendCommandConfig;
   sessionCwd: string;

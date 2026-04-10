@@ -2,6 +2,9 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { Text } from "@mariozechner/pi-tui";
 import { highlightCode, getLanguageFromPath, keyHint } from "@mariozechner/pi-coding-agent";
+import { AssistantMessageEventStream } from "@mariozechner/pi-ai";
+import type { Model, Context, SimpleStreamOptions, Api } from "@mariozechner/pi-ai";
+import Anthropic from "@anthropic-ai/sdk";
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes, createHash } from "node:crypto";
 import { rmSync, readFileSync, existsSync, appendFileSync, writeFileSync, mkdirSync, realpathSync } from "node:fs";
@@ -592,11 +595,168 @@ async function isServerReachable(inst: AcpInstance): Promise<boolean> {
   }
 }
 
+// ── Custom streamSimple with session ID cookie jar ──────────────────
+// Uses the Anthropic SDK directly with a custom `fetch` that captures
+// x-acp-session-id from response headers. Also strips Pi's system
+// prompt and tools since the ACP server provides its own.
+
+type SessionIdStore = { current: string | null };
+
+function createSessionCapturingFetch(sessionIdStore: SessionIdStore): typeof globalThis.fetch {
+  const baseFetch = globalThis.fetch;
+  return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const response = await baseFetch(input, init);
+    const sid = response.headers.get("x-acp-session-id");
+    if (sid && sid !== sessionIdStore.current) {
+      debug(`fetch: captured x-acp-session-id=${sid.slice(0, 16)}`);
+      sessionIdStore.current = sid;
+    }
+    return response;
+  };
+}
+
+function mapStopReason(reason: string): string {
+  return reason === "end_turn" ? "stop" : reason === "max_tokens" ? "length" : reason === "tool_use" ? "toolUse" : "stop";
+}
+
+function createAcpStreamSimple(sessionIdStore: SessionIdStore) {
+  const capturingFetch = createSessionCapturingFetch(sessionIdStore);
+
+  return function acpStreamSimple(
+    model: Model<Api>,
+    context: Context,
+    options?: SimpleStreamOptions,
+  ): AssistantMessageEventStream {
+    const stream = new AssistantMessageEventStream();
+
+    (async () => {
+      const output: any = {
+        role: "assistant", content: [], api: model.api, provider: model.provider,
+        model: model.id, stopReason: "stop", timestamp: Date.now(),
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+                 cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      };
+
+      try {
+        const headers: Record<string, string> = {
+          ...(model.headers || {}), ...(options?.headers || {}),
+        };
+        if (sessionIdStore.current) {
+          headers["x-acp-session-id"] = sessionIdStore.current;
+          debug(`acpStreamSimple: sending x-acp-session-id=${sessionIdStore.current.slice(0, 16)}`);
+        }
+
+        const client = new Anthropic({
+          apiKey: options?.apiKey || "",
+          baseURL: model.baseUrl,
+          dangerouslyAllowBrowser: true,
+          defaultHeaders: headers,
+          fetch: capturingFetch,
+        });
+
+        // Strip Pi's system prompt and tools - the ACP server provides its own.
+        const params: any = {
+          model: model.id,
+          messages: context.messages.map((msg: any) => {
+            if (msg.role === "user") {
+              if (typeof msg.content === "string") return { role: "user", content: msg.content };
+              return { role: "user", content: msg.content.map((b: any) =>
+                b.type === "text" ? { type: "text", text: b.text }
+                : b.type === "image" ? { type: "image", source: { type: "base64", media_type: b.mimeType, data: b.data } }
+                : b
+              )};
+            }
+            if (msg.role === "assistant") {
+              return { role: "assistant", content: msg.content.map((b: any) =>
+                b.type === "text" ? { type: "text", text: b.text }
+                : b.type === "thinking" ? (b.thinkingSignature?.trim()
+                    ? { type: "thinking", thinking: b.thinking, signature: b.thinkingSignature }
+                    : { type: "text", text: b.thinking })
+                : b.type === "toolCall" ? { type: "tool_use", id: b.id, name: b.name, input: b.arguments ?? {} }
+                : b
+              ).filter((b: any) => !(b.type === "text" && !b.text?.trim())) };
+            }
+            if (msg.role === "toolResult") {
+              return { role: "user", content: [{
+                type: "tool_result", tool_use_id: msg.toolCallId,
+                content: msg.content.map((c: any) => c.type === "text" ? { type: "text", text: c.text } : c),
+                is_error: msg.isError,
+              }]};
+            }
+            return msg;
+          }).filter((m: any) => {
+            if (!Array.isArray(m.content)) return m.content?.trim();
+            return m.content.length > 0;
+          }),
+          max_tokens: options?.maxTokens || (model.maxTokens / 3) | 0,
+          stream: true,
+        };
+        if (options?.temperature !== undefined) params.temperature = options.temperature;
+
+        const sdk = client.messages.stream(params, { signal: options?.signal });
+        stream.push({ type: "start", partial: output });
+
+        const blocks = output.content as any[];
+        for await (const event of sdk) {
+          if (event.type === "message_start") {
+            const u = event.message.usage;
+            Object.assign(output.usage, { input: u.input_tokens || 0, output: u.output_tokens || 0,
+              cacheRead: (u as any).cache_read_input_tokens || 0, cacheWrite: (u as any).cache_creation_input_tokens || 0 });
+            output.usage.totalTokens = output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
+          } else if (event.type === "content_block_start") {
+            const cb = event.content_block;
+            const ci = output.content.length;
+            if (cb.type === "text") { blocks.push({ type: "text", text: "", _idx: event.index }); stream.push({ type: "text_start", contentIndex: ci, partial: output }); }
+            else if (cb.type === "thinking") { blocks.push({ type: "thinking", thinking: "", thinkingSignature: "", _idx: event.index }); stream.push({ type: "thinking_start", contentIndex: ci, partial: output }); }
+            else if (cb.type === "tool_use") { blocks.push({ type: "toolCall", id: cb.id, name: cb.name, arguments: cb.input ?? {}, _json: "", _idx: event.index }); stream.push({ type: "toolcall_start", contentIndex: ci, partial: output }); }
+          } else if (event.type === "content_block_delta") {
+            const i = blocks.findIndex((b: any) => b._idx === event.index);
+            const b = blocks[i];
+            if (!b) continue;
+            if (event.delta.type === "text_delta" && b.type === "text") { b.text += event.delta.text; stream.push({ type: "text_delta", contentIndex: i, delta: event.delta.text, partial: output }); }
+            else if (event.delta.type === "thinking_delta" && b.type === "thinking") { b.thinking += event.delta.thinking; stream.push({ type: "thinking_delta", contentIndex: i, delta: event.delta.thinking, partial: output }); }
+            else if (event.delta.type === "input_json_delta" && b.type === "toolCall") { b._json += event.delta.partial_json; try { b.arguments = JSON.parse(b._json); } catch {} stream.push({ type: "toolcall_delta", contentIndex: i, delta: event.delta.partial_json, partial: output }); }
+            else if (event.delta.type === "signature_delta" && b.type === "thinking") { b.thinkingSignature = (b.thinkingSignature || "") + event.delta.signature; }
+          } else if (event.type === "content_block_stop") {
+            const i = blocks.findIndex((b: any) => b._idx === event.index);
+            const b = blocks[i];
+            if (!b) continue;
+            delete b._idx;
+            if (b.type === "text") stream.push({ type: "text_end", contentIndex: i, content: b.text, partial: output });
+            else if (b.type === "thinking") stream.push({ type: "thinking_end", contentIndex: i, content: b.thinking, partial: output });
+            else if (b.type === "toolCall") { try { b.arguments = JSON.parse(b._json); } catch {} delete b._json; stream.push({ type: "toolcall_end", contentIndex: i, toolCall: b, partial: output }); }
+          } else if (event.type === "message_delta") {
+            if (event.delta.stop_reason) output.stopReason = mapStopReason(event.delta.stop_reason);
+            if (event.usage.output_tokens != null) output.usage.output = event.usage.output_tokens;
+            output.usage.totalTokens = output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
+          }
+        }
+
+        if (options?.signal?.aborted) throw new Error("Request was aborted");
+        stream.push({ type: "done", reason: output.stopReason, message: output });
+        stream.end();
+      } catch (error) {
+        for (const b of output.content) { delete b._idx; delete b._json; }
+        output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+        output.errorMessage = error instanceof Error ? error.message : String(error);
+        stream.push({ type: "error", reason: output.stopReason, error: output });
+        stream.end();
+      }
+    })();
+
+    return stream;
+  };
+}
+
 export default function (pi: ExtensionAPI) {
   // Derive a stable instance ID from the Pi process PID so each Pi session
   // gets its own isolated server. Falls back to a random ID.
   const instanceId = `pi-${process.pid}-${randomBytes(4).toString("hex")}`;
   const inst = getOrCreateInstance(instanceId);
+
+  // Session ID store: captures x-acp-session-id from server response headers.
+  // Acts as a cookie jar so the server knows which ACP session to route to.
+  const sessionIdStore: SessionIdStore = { current: null };
 
   // Helper: start the server, fetch dynamic models, and register the provider.
   async function startAndRegister(cwd: string, sessionId: string, ctx: any): Promise<void> {
@@ -604,6 +764,9 @@ export default function (pi: ExtensionAPI) {
     inst.process = proc;
     inst.port = port;
     inst.apiKey = apiKey;
+
+    // Reset the session ID store on server (re)start so the server creates a fresh ACP session
+    sessionIdStore.current = null;
 
     // Fetch the real model list from the backend
     const backendModels = await fetchModelsFromBackend(port, apiKey);
@@ -618,7 +781,7 @@ export default function (pi: ExtensionAPI) {
       baseUrl: `http://127.0.0.1:${port}`,
       api: "anthropic-messages",
       apiKey,
-      headers: { "x-acp-client-id": instanceId },
+      streamSimple: createAcpStreamSimple(sessionIdStore),
       models,
     });
 
@@ -671,47 +834,12 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
-  // ── Strip Pi context from ACP requests ─────────────────────────────
-  pi.on("before_provider_request", async (event, ctx) => {
-    const payload = event.payload;
-
-    if (ctx.model?.provider !== "claude-acp") return;
-
-    debug(`=== REQUEST === model=${(payload as any).model} msgs=${payload.messages?.length} tools=${payload.tools?.length}`);
-
-    if (payload.messages && payload.messages.length > 0) {
-      const lastMsg = payload.messages[payload.messages.length - 1];
-      const lastContent = Array.isArray(lastMsg.content)
-        ? lastMsg.content.map((b: any) => b.type).join(", ")
-        : typeof lastMsg.content === "string" ? "text" : "unknown";
-      debug(`Last msg: role=${lastMsg.role} types=[${lastContent}]`);
-
-      if (lastMsg.role === "user" && Array.isArray(lastMsg.content)) {
-        const hasToolResult = lastMsg.content.some((b: any) => b.type === "tool_result");
-        const hasUserText = lastMsg.content.some((b: any) => b.type === "text" && b.text?.trim());
-        debug(`tool_result=${hasToolResult} user_text=${hasUserText}`);
-      }
-    }
-
-    // Remove Pi system prompt
-    if (payload.system) {
-      delete payload.system;
-      debug("Stripped system prompt");
-    }
-
-    // Clear Pi tools
-    if (payload.tools && Array.isArray(payload.tools)) {
-      payload.tools = [];
-    }
-
-    return payload;
-  });
-
   // ── Register provider (placeholder until server starts) ───────────
   pi.registerProvider("claude-acp", {
     baseUrl: "http://127.0.0.1:1",
     api: "anthropic-messages",
     apiKey: "not-started",
+    streamSimple: createAcpStreamSimple(instanceId),
     models: [{
       id: "default",
       name: "Claude ACP",

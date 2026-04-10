@@ -19,10 +19,10 @@ export interface Logger {
 
 export interface BackendManager {
   initialize(): Promise<void>;
-  /** Ensure an ACP session exists for the given client. Creates or resumes as needed. */
-  ensureSession(clientId: string | undefined, cwd?: string): Promise<NewSessionResponse>;
-  /** Clear the cached ACP session for a specific client, or all clients if omitted. */
-  resetSession(clientId?: string): void;
+  /** Ensure an ACP session exists. Resumes sessionId if provided, creates new if not. */
+  ensureSession(sessionId: string | undefined, cwd?: string): Promise<NewSessionResponse>;
+  /** Signal that a session was reset (e.g. compaction). No-op for stateless backends. */
+  resetSession(sessionId?: string): void;
   setSessionMode(sessionId: SessionId, modeId: string): Promise<void>;
   setSessionModel(sessionId: SessionId, model: string): Promise<void>;
   prompt(options: PromptExecutionOptions): Promise<PromptResponse>;

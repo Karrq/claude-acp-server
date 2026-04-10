@@ -5,6 +5,7 @@ export const DEFAULT_ANTHROPIC_VERSION = "2023-06-01";
 export const DEFAULT_HOST = "127.0.0.1";
 export const DEFAULT_PORT = 4319;
 export const DEFAULT_SESSION_HEADER = "x-acp-session-id";
+export const DEFAULT_CLIENT_ID_HEADER = "x-acp-client-id";
 export const DEFAULT_REQUEST_ID_HEADER = "request-id";
 export const DEFAULT_CWD_HEADER = "x-acp-cwd";
 export const DEFAULT_TERMINAL_OUTPUT_BYTE_LIMIT = 128 * 1024;
@@ -64,6 +65,7 @@ export function loadServerConfig(
     anthropicVersion: env.ANTHROPIC_VERSION ?? DEFAULT_ANTHROPIC_VERSION,
     traceRequests: env.CLAUDE_ACP_TRACE_REQUESTS === "1",
     sessionHeader: DEFAULT_SESSION_HEADER,
+    clientIdHeader: DEFAULT_CLIENT_ID_HEADER,
     requestIdHeader: DEFAULT_REQUEST_ID_HEADER,
     backend,
     sessionCwd,

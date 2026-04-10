@@ -88,6 +88,14 @@ export class AnthropicAcpFacade implements AnthropicFacade {
    */
   private sessions = new Map<string, SessionState>();
 
+  /**
+   * Maps stable client-provided IDs to ACP session IDs. Clients that can't
+   * easily read response headers (e.g. Pi extensions using built-in streamSimple)
+   * send a stable x-acp-client-id instead. The server looks up the last session
+   * for that client, avoiding the need for a response-header cookie jar.
+   */
+  private clientSessions = new Map<string, string>();
+
   private getSession(sessionId: string): SessionState {
     let state = this.sessions.get(sessionId);
     if (!state) {
@@ -137,13 +145,22 @@ export class AnthropicAcpFacade implements AnthropicFacade {
 
     const requestedCwd =
       headers.get(this.config.cwdHeader) ?? inferWorkingDirectoryFromRequest(body) ?? undefined;
-    // Use x-acp-client-id if provided; fall back to x-acp-session-id for
-    // backwards compatibility (clients that echo the session ID back).
-    const clientId = headers.get("x-acp-client-id")
-      || headers.get(this.config.sessionHeader)
-      || undefined;
-    const ensured = await this.backend.ensureSession(clientId, requestedCwd);
+    // Resolve session ID: explicit header takes priority, then client ID lookup.
+    // Clients that can read response headers send x-acp-session-id directly.
+    // Clients that can't (e.g. Pi extension) send a stable x-acp-client-id and
+    // the server looks up the last session for that client.
+    const clientId = headers.get(this.config.clientIdHeader) || undefined;
+    const requestedSessionId =
+      headers.get(this.config.sessionHeader) ||
+      (clientId ? this.clientSessions.get(clientId) : undefined) ||
+      undefined;
+    const ensured = await this.backend.ensureSession(requestedSessionId, requestedCwd);
     const sessionId = ensured.sessionId;
+
+    // Update client -> session mapping
+    if (clientId) {
+      this.clientSessions.set(clientId, sessionId);
+    }
     const session = this.getSession(sessionId);
 
     if (this.config.permissionMode && ensured.modes?.availableModes?.length) {
@@ -206,7 +223,12 @@ export class AnthropicAcpFacade implements AnthropicFacade {
     debugLog(`handleMessages: active=${session.hasActiveSession} hasHistory=${hasHistory} expected=[${session.expectedRoleSequence.join(",")}] incoming=[${incomingRoles.join(",")}] isReset=${isSessionReset}`);
 
     if (isSessionReset) {
-      return this.handleSessionReset(clientId, sessionId, body, requestedModel, signal, streamObserver);
+      const turn = await this.handleSessionReset(sessionId, body, requestedModel, signal, streamObserver);
+      // Update client mapping to point to the new session created by the reset
+      if (clientId) {
+        this.clientSessions.set(clientId, turn.sessionId);
+      }
+      return turn;
     }
 
     // Normal path: incremental prompt
@@ -288,7 +310,6 @@ export class AnthropicAcpFacade implements AnthropicFacade {
    * toPromptRequest so the backend picks up the new context.
    */
   private async handleSessionReset(
-    clientId: string | undefined,
     oldSessionId: string,
     body: MessageCreateParamsBase,
     model: string,
@@ -308,11 +329,11 @@ export class AnthropicAcpFacade implements AnthropicFacade {
     // Clear state from the old session
     clearTurnBuffer(oldSessionId);
     this.sessions.delete(oldSessionId);
-    this.backend.resetSession(clientId);
+    this.backend.resetSession(oldSessionId);
 
-    // Create a fresh ACP session for this client
+    // Create a fresh ACP session (no session ID = force new)
     const requestedCwd = inferWorkingDirectoryFromRequest(body) ?? undefined;
-    const ensured = await this.backend.ensureSession(clientId, requestedCwd);
+    const ensured = await this.backend.ensureSession(undefined, requestedCwd);
     const sessionId = ensured.sessionId;
     debugLog(`handleSessionReset: new session=${sessionId.slice(0, 8)}`);
 

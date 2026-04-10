@@ -18,6 +18,7 @@ function buildConfig(overrides: Partial<ServerConfig> = {}): ServerConfig {
     anthropicVersion: "2023-06-01",
     traceRequests: false,
     sessionHeader: "x-acp-session-id",
+    clientIdHeader: "x-acp-client-id",
     requestIdHeader: "request-id",
     sessionCwd: process.cwd(),
     cwdHeader: "x-acp-cwd",
