@@ -80,10 +80,7 @@ function loadAppendSystem(): string | null {
   if (appendSystemContent !== null) return appendSystemContent;
 
   const paths = [
-    join(
-      process.env.HOME || "/root",
-      ".pi/agent/APPEND_SYSTEM.md",
-    ),
+    join(process.env.HOME || "/root", ".pi/agent/APPEND_SYSTEM.md"),
   ];
 
   for (const path of paths) {
@@ -113,7 +110,7 @@ export interface ServerStartResult {
 }
 
 export interface ServerStartOptions {
-  /** Override the server dist path (defaults to auto-detection relative to caller) */
+  /** Override the server dist path (defaults to auto-detection) */
   serverDistPath?: string;
   /** Override ACP backend command (default: "npx") */
   backendCommand?: string;
@@ -129,7 +126,6 @@ export async function startServer(
 ): Promise<ServerStartResult> {
   debug(`startServer: cwd=${cwd} sessionId=${sessionId}`);
 
-  // Kill only this instance's old process (if any) before finding a free port.
   if (inst.process && !inst.process.killed) {
     inst.process.kill("SIGKILL");
     inst.process = null;
@@ -147,13 +143,10 @@ export async function startServer(
     ...(customPrompt && { systemPrompt: customPrompt }),
   };
 
-  debug(
-    `CLAUDE_ACP_OPTIONS: ${JSON.stringify(claudeCodeOptions).slice(0, 300)}`,
-  );
+  debug(`CLAUDE_ACP_OPTIONS: ${JSON.stringify(claudeCodeOptions).slice(0, 300)}`);
 
   const backendCommand = options?.backendCommand ?? "npx";
-  const backendArgs =
-    options?.backendArgs ?? "-y @agentclientprotocol/claude-agent-acp";
+  const backendArgs = options?.backendArgs ?? "-y @agentclientprotocol/claude-agent-acp";
 
   const env = {
     ...process.env,
@@ -170,8 +163,6 @@ export async function startServer(
     CLAUDE_ACP_OPTIONS: JSON.stringify(claudeCodeOptions),
   };
 
-  // Resolve server path.
-  // Default: derive from the shared/ directory -> up to repo root -> dist/index.js
   const serverPath =
     options?.serverDistPath ??
     join(
@@ -184,7 +175,6 @@ export async function startServer(
     );
 
   debug(`Using server at: ${serverPath}`);
-  debug(`Spawn command: node ${serverPath} PORT=${port} HOST=127.0.0.1`);
 
   const proc = spawn("node", [serverPath], {
     env,
@@ -194,7 +184,6 @@ export async function startServer(
 
   debug(`startServer: spawned PID=${proc.pid}`);
 
-  // Log ALL stdout/stderr for debugging
   proc.stdout?.on("data", (data: Buffer) => {
     debug(`Server stdout: ${data.toString().slice(0, 500)}`);
   });
@@ -210,9 +199,7 @@ export async function startServer(
     }, 30000);
     const checkListening = (data: Buffer) => {
       const text = data.toString();
-      debug(
-        `startServer: checking data for 'listening': ${text.slice(0, 200)}`,
-      );
+      debug(`startServer: checking data for 'listening': ${text.slice(0, 200)}`);
       if (text.includes("listening")) {
         clearTimeout(timeout);
         debug(`startServer: server is listening on port ${port}`);
@@ -300,7 +287,6 @@ export async function startServerAndFetchModels(
   inst.port = port;
   inst.apiKey = apiKey;
 
-  // Fetch the real model list from the backend
   const backendModels = await fetchModelsFromBackend(port, apiKey);
   const models = backendModels.length > 0 ? backendModels : DEFAULT_MODELS;
 
@@ -321,20 +307,13 @@ export async function ensureServerRunning(
 ): Promise<{ restarted: boolean; models: AcpModelConfig[] }> {
   const reachable = await isServerReachable(inst);
   if (reachable) {
-    debug(
-      `ensureServerRunning: server is reachable on port ${inst.port}`,
-    );
+    debug(`ensureServerRunning: server is reachable on port ${inst.port}`);
     return { restarted: false, models: [] };
   }
   debug(`ensureServerRunning: server unreachable, restarting`);
   const sessionId = inst.sessionId || getSessionId();
   inst.sessionId = sessionId;
-  const result = await startServerAndFetchModels(
-    cwd,
-    sessionId,
-    inst,
-    options,
-  );
+  const result = await startServerAndFetchModels(cwd, sessionId, inst, options);
   return { restarted: true, models: result.models };
 }
 
@@ -346,7 +325,6 @@ export async function ensureServerRunning(
  */
 export function stripHostAgentContext(
   payload: Record<string, unknown>,
-  providerName: string = "claude-acp",
 ): Record<string, unknown> | undefined {
   const model = payload.model as string | undefined;
   const messages = payload.messages as Array<Record<string, unknown>> | undefined;
@@ -355,40 +333,13 @@ export function stripHostAgentContext(
     `=== REQUEST === model=${model} msgs=${messages?.length} tools=${(payload.tools as Array<unknown>)?.length}`,
   );
 
-  if (messages && messages.length > 0) {
-    const lastMsg = messages[messages.length - 1];
-    const lastContent = Array.isArray(lastMsg.content)
-      ? (lastMsg.content as Array<Record<string, unknown>>)
-          .map((b) => b.type)
-          .join(", ")
-      : typeof lastMsg.content === "string"
-        ? "text"
-        : "unknown";
-    debug(`Last msg: role=${lastMsg.role} types=[${lastContent}]`);
-
-    if (
-      lastMsg.role === "user" &&
-      Array.isArray(lastMsg.content)
-    ) {
-      const hasToolResult = (
-        lastMsg.content as Array<Record<string, unknown>>
-      ).some((b) => b.type === "tool_result");
-      const hasUserText = (
-        lastMsg.content as Array<Record<string, unknown>>
-      ).some(
-        (b) => b.type === "text" && (b.text as string)?.trim(),
-      );
-      debug(`tool_result=${hasToolResult} user_text=${hasUserText}`);
-    }
-  }
-
   // Remove host system prompt
   if (payload.system) {
     delete payload.system;
     debug("Stripped system prompt");
   }
 
-  // Clear host tools
+  // Clear host tools — the ACP backend provides its own
   if (payload.tools && Array.isArray(payload.tools)) {
     payload.tools = [];
   }

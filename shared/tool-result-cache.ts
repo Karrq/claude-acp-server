@@ -21,7 +21,6 @@ export function readToolResult(toolCallId: string): ToolResultData | null {
     const p = join(RESULTS_DIR, `${toolCallId}.json`);
     if (existsSync(p)) {
       const raw = JSON.parse(readFileSync(p, "utf8"));
-      // Handle both old format (plain string) and new format ({text, is_error, details})
       if (typeof raw === "string") return { text: raw, is_error: false, details: {} };
       return {
         text: raw.text || "",

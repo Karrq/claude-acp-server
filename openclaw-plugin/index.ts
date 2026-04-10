@@ -1,10 +1,15 @@
 /**
  * OpenClaw provider plugin for claude-acp-server.
  *
+ * The upstream server now handles multi-client concurrency natively via
+ * ClientRegistry (API key = client identity, x-acp-session-id for session
+ * continuity). Each OpenClaw agent session gets its own server instance
+ * (matching the Pi extension pattern) for full isolation.
+ *
  * Build note: When packaging as an installable OpenClaw plugin, add
  * `openclaw/plugin-sdk` and `@sinclair/typebox` as peerDependencies
- * and use the real imports instead of the inline stubs below.
- * The inline approach lets this file compile standalone in the repo.
+ * and use the real SDK imports. The inline approach lets this file
+ * compile standalone in the repo.
  */
 
 import { randomBytes } from "node:crypto";
@@ -62,6 +67,8 @@ export default {
     }
 
     // ── Register ACP tools ──────────────────────────────────────────
+    // OpenClaw executes these when it sees tool_use blocks in the ACP
+    // response. They return cached results written by the server translator.
     const toolNames = ["Bash", "Read", "Write", "Edit", "Glob", "Grep"];
 
     for (const name of toolNames) {
@@ -151,12 +158,17 @@ export default {
     });
 
     // ── Hook: strip host-agent context before forwarding ────────────
-    api.registerHook("before_provider_request", async (event: any, ctx: any) => {
-      if (ctx.model?.provider !== PROVIDER_ID) return;
-      return stripHostAgentContext(
-        event.payload as Record<string, unknown>,
-      );
-    });
+    // The ACP backend provides its own tools and prompts.
+    // x-acp-session-id is handled by the server's ClientRegistry.
+    api.registerHook(
+      "before_provider_request",
+      async (event: any, ctx: any) => {
+        if (ctx.model?.provider !== PROVIDER_ID) return;
+        return stripHostAgentContext(
+          event.payload as Record<string, unknown>,
+        );
+      },
+    );
 
     // ── Hook: start server when model is selected ───────────────────
     api.registerHook("model_select", async (event: any, ctx: any) => {
