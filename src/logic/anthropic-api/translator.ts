@@ -59,6 +59,13 @@ class AnthropicStreamCollector {
   private pendingText = "";
   private pendingBridge = "";
   private readonly toolCallTitles = new Map<string, string>();
+  // Per-call context usage from the last usage_update notification.
+  // The ACP backend accumulates usage across ALL internal LLM calls within
+  // a single prompt, but usage_update.used reflects only the last call's
+  // total context consumption - which is what callers need for context
+  // window tracking.
+  private lastUsageUpdate: { used: number; size: number } | null = null;
+
   // Track ACP tool uses so we can emit proper tool_use/tool_result blocks
   private readonly acpToolUses: Map<string, {
     toolName: string;
@@ -583,6 +590,18 @@ class AnthropicStreamCollector {
     const emitted: RawMessageStreamEvent[] = [];
     const update = notification.update;
 
+    // Capture per-call context usage from usage_update notifications.
+    // The ACP backend sends these with `used` = total tokens from the last
+    // individual LLM call, as opposed to PromptResponse.usage which is
+    // cumulative across all internal calls in the prompt.
+    if (update.sessionUpdate === "usage_update") {
+      if (typeof update.used === "number" && typeof update.size === "number") {
+        this.lastUsageUpdate = { used: update.used, size: update.size };
+        debug(`usage_update: used=${update.used} size=${update.size}`);
+      }
+      return emitted;
+    }
+
     if (update.sessionUpdate === "agent_thought_chunk" && update.content.type === "text") {
       this.emitThinkingDelta(update.content.text, emitted);
       this.streamEvents.push(...emitted);
@@ -626,10 +645,38 @@ class AnthropicStreamCollector {
   }
 
   finish(response: PromptResponse): FinalizedAnthropicTurn {
-    this.usage.cache_creation_input_tokens = response.usage?.cachedWriteTokens ?? null;
-    this.usage.cache_read_input_tokens = response.usage?.cachedReadTokens ?? null;
-    this.usage.input_tokens = response.usage?.inputTokens ?? 0;
-    this.usage.output_tokens = response.usage?.outputTokens ?? 0;
+    if (this.lastUsageUpdate && this.lastUsageUpdate.used > 0) {
+      // PromptResponse.usage is cumulative across all internal LLM calls
+      // within a single ACP prompt, which inflates context percentages.
+      // usage_update.used is the per-call total from the last individual
+      // LLM call - the actual context window consumption.
+      this.usage.input_tokens = this.lastUsageUpdate.used;
+      this.usage.output_tokens = 0;
+      this.usage.cache_read_input_tokens = 0;
+      this.usage.cache_creation_input_tokens = 0;
+      debug(`finish: using usage_update per-call total=${this.lastUsageUpdate.used}`);
+    } else {
+      const cumTotal = (response.usage?.inputTokens ?? 0) +
+        (response.usage?.outputTokens ?? 0) +
+        (response.usage?.cachedReadTokens ?? 0) +
+        (response.usage?.cachedWriteTokens ?? 0);
+
+      if (cumTotal > 0) {
+        // Genuine response with usage data (e.g. backend without usage_update support)
+        this.usage.cache_creation_input_tokens = response.usage?.cachedWriteTokens ?? 0;
+        this.usage.cache_read_input_tokens = response.usage?.cachedReadTokens ?? 0;
+        this.usage.input_tokens = response.usage?.inputTokens ?? 0;
+        this.usage.output_tokens = response.usage?.outputTokens ?? 0;
+      } else {
+        // Intermediate tool_use chunk - set null so consumers keep their
+        // previous estimate (from message_start) instead of resetting to 0
+        this.usage.cache_creation_input_tokens = null;
+        this.usage.cache_read_input_tokens = null;
+        this.usage.input_tokens = null as unknown as number;
+        this.usage.output_tokens = null as unknown as number;
+        debug(`finish: no usage data for intermediate chunk, setting null to preserve previous estimate`);
+      }
+    }
 
     const emitted: RawMessageStreamEvent[] = [];
     if (this.enableToolBridge && !this.bridgedToolUse) {
